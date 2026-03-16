@@ -1,0 +1,35 @@
+[package]
+name = "contract1"
+edition = { workspace = true }
+rust-version = "1.81"
+
+[[bin]]
+name = "contract1"
+path = "src/main.rs"
+required-features = ["risc0"]
+test = false
+
+[dependencies]
+anyhow = { workspace = true }
+sdk = { workspace = true }
+serde = { workspace = true, features = ["derive", "alloc"] }
+borsh = { workspace = true }
+risc0-zkvm = { workspace = true, optional = true, features = ['std'] }
+client-sdk = { workspace = true, optional = true, features = [
+  "risc0",
+  "rest",
+  "indexer",
+] }
+
+[dev-dependencies]
+# Active client feature for tests
+contract1 = { path = ".", features = ["client"] }
+clap = { workspace = true, features = ["derive"] }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = ["full", "tracing"] }
+risc0-zkvm = { workspace = true, features = ['std', 'prove'] }
+
+[features]
+default = []
+client = ["dep:client-sdk"]
+risc0 = ["dep:risc0-zkvm", "sdk/risc0"]
