@@ -2,3 +2,5 @@ target
 data
 node_modules
 backend_logs*.txt
+.claude
+.cargo

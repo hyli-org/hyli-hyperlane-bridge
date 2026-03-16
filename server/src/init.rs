@@ -1,74 +1,111 @@
-use anyhow::{bail, Result};
-use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
-use sdk::{api::APIRegisterContract, info, ContractName, ProgramId, StateCommitment};
-use std::{sync::Arc, time::Duration};
-use tokio::time::timeout;
+use alloy_primitives::keccak256;
+use anyhow::{Context, Result};
+use client_sdk::rest_client::{NodeApiClient, NodeApiHttpClient};
+use hyperlane_bridge::client::tx_executor_handler::metadata;
+use hyperlane_bridge::HyperlaneBridgeState;
+use k256::ecdsa::SigningKey;
+use sdk::{
+    api::APIRegisterContract, ContractName, ProgramId, StateCommitment, Verifier, ZkContract,
+};
+use std::sync::Arc;
+use std::time::Duration;
+use tracing::info;
 
-pub struct ContractInit {
-    pub name: ContractName,
-    pub program_id: [u8; 32],
-    pub initial_state: StateCommitment,
-}
+use crate::conf::Conf;
 
-pub async fn init_node(
-    node: Arc<NodeApiHttpClient>,
-    indexer: Arc<IndexerApiHttpClient>,
-    contracts: Vec<ContractInit>,
-) -> Result<()> {
-    for contract in contracts {
-        init_contract(&node, &indexer, contract).await?;
-    }
-    Ok(())
-}
-
-async fn init_contract(
-    node: &NodeApiHttpClient,
-    indexer: &IndexerApiHttpClient,
-    contract: ContractInit,
-) -> Result<()> {
-    match indexer.get_indexer_contract(&contract.name).await {
-        Ok(existing) => {
-            let onchain_program_id = hex::encode(existing.program_id.as_slice());
-            let program_id = hex::encode(contract.program_id);
-            if onchain_program_id != program_id {
-                bail!(
-                    "Invalid program_id for {}. On-chain version is {}, expected {}",
-                    contract.name,
-                    onchain_program_id,
-                    program_id
-                );
+/// Derives a 65-byte uncompressed secp256k1 public key from a contract name.
+/// Matches the `derive_program_pubkey` logic in the reth-verifier.
+fn derive_program_pubkey(contract_name: &ContractName) -> ProgramId {
+    let mut seed: [u8; 32] = keccak256(contract_name.0.as_bytes()).into();
+    let signing_key = loop {
+        match SigningKey::from_slice(&seed) {
+            Ok(key) => break key,
+            Err(_) => {
+                seed = keccak256(seed).into();
             }
-            info!("✅ {} contract is up to date", contract.name);
         }
+    };
+    let encoded = signing_key.verifying_key().to_encoded_point(false);
+    ProgramId(encoded.as_bytes().to_vec())
+}
+
+pub async fn init_contracts(conf: &Conf, node: Arc<NodeApiHttpClient>) -> Result<()> {
+    let bridge_cn = ContractName(conf.bridge_cn.clone());
+    let hyperlane_cn = ContractName(conf.hyperlane_cn.clone());
+
+    // ── Contract A: HyperlaneBridgeState (risc0) ──────────────────────────────
+    let bridge_state = HyperlaneBridgeState {
+        hyperlane_contract: hyperlane_cn.clone(),
+        token_contract: ContractName(conf.token_cn.clone()),
+    };
+
+    match node.get_contract(bridge_cn.clone()).await {
+        Ok(_) => info!(
+            "Contract '{}' already exists, skipping registration",
+            bridge_cn
+        ),
         Err(_) => {
-            info!("🚀 Registering {} contract", contract.name);
+            info!("Registering contract '{}'...", bridge_cn);
             node.register_contract(APIRegisterContract {
-                verifier: "risc0-1".into(),
-                program_id: ProgramId(contract.program_id.to_vec()),
-                state_commitment: contract.initial_state,
-                contract_name: contract.name.clone(),
-                ..Default::default()
+                verifier: Verifier("risc0-3".to_string()),
+                program_id: ProgramId(metadata::HYPERLANE_BRIDGE_PROGRAM_ID.to_vec()),
+                state_commitment: bridge_state.commit(),
+                contract_name: bridge_cn.clone(),
+                timeout_window: None,
+                constructor_metadata: None,
             })
-            .await?;
-            wait_contract_state(indexer, &contract.name).await?;
+            .await
+            .context("Registering hyperlane-bridge contract")?;
+
+            wait_for_contract(node.clone(), &bridge_cn).await?;
+            info!("Contract '{}' registered successfully", bridge_cn);
         }
     }
+
+    // ── Contract B: hyperlane (reth verifier) ─────────────────────────────────
+    let eth_state_root_hex = conf.eth_state_root.trim_start_matches("0x");
+    let eth_state_root = hex::decode(eth_state_root_hex).context("Decoding eth_state_root hex")?;
+
+    match node.get_contract(hyperlane_cn.clone()).await {
+        Ok(_) => info!(
+            "Contract '{}' already exists, skipping registration",
+            hyperlane_cn
+        ),
+        Err(_) => {
+            info!("Registering contract '{}'...", hyperlane_cn);
+
+            // Hyperlane program_id is derived from the hyperlane-bridge contract name,
+            // matching the reth-verifier's derive_program_pubkey logic.
+            let program_id = derive_program_pubkey(&bridge_cn);
+
+            node.register_contract(APIRegisterContract {
+                verifier: Verifier(hyli_model::verifiers::RETH.to_string()),
+                program_id,
+                state_commitment: StateCommitment(eth_state_root),
+                contract_name: hyperlane_cn.clone(),
+                timeout_window: None,
+                constructor_metadata: None,
+            })
+            .await
+            .context("Registering hyperlane contract")?;
+
+            wait_for_contract(node.clone(), &hyperlane_cn).await?;
+            info!("Contract '{}' registered successfully", hyperlane_cn);
+        }
+    }
+
     Ok(())
 }
-async fn wait_contract_state(
-    indexer: &IndexerApiHttpClient,
-    contract: &ContractName,
-) -> anyhow::Result<()> {
-    timeout(Duration::from_secs(30), async {
+
+async fn wait_for_contract(node: Arc<NodeApiHttpClient>, name: &ContractName) -> Result<()> {
+    tokio::time::timeout(Duration::from_secs(30), async {
         loop {
-            let resp = indexer.get_indexer_contract(contract).await;
-            if resp.is_err() {
-                info!("⏰ Waiting for contract {contract} state to be ready");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            } else {
-                return Ok(());
+            if node.get_contract(name.clone()).await.is_ok() {
+                return;
             }
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     })
-    .await?
+    .await
+    .with_context(|| format!("Timeout waiting for contract '{name}'"))
 }

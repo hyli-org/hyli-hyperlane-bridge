@@ -1,14 +1,18 @@
-id = "scaffold"
-log_format = "full"
-
-data_directory = "data"
-da_read_from = "127.0.0.1:4141"
-
-rest_server_port = 9002
-rest_server_max_body_size = 10_485_760 # 10 MB
 node_url = "http://localhost:4321"
-indexer_url = "http://localhost:4321"
+server_port = 4000
+log_format = "full"
+hyli_chain_id = 1337
+eth_state_root = "0000000000000000000000000000000000000000000000000000000000000000"
+bridge_cn = "hyperlane-bridge"
+hyperlane_cn = "hyperlane"
+token_cn = "oranj"
+data_directory = "data/bridge-server"
+noinit = false
 
-buffer_blocks = 0
-max_txs_per_proof = 30
-tx_working_window_size = 150
+# ContractListener / AutoProver
+indexer_database_url = "postgresql://postgres:postgres@localhost:5432/hyli_indexer"
+contract_listener_poll_interval_secs = 5
+prover_tx_buffer_size = 0
+prover_max_txs_per_proof = 10
+prover_tx_working_window_size = 50
+prover_idle_flush_interval_secs = 2

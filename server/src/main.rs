@@ -1,150 +1,121 @@
 use anyhow::{Context, Result};
-use app::{AppModule, AppModuleCtx};
 use axum::Router;
 use clap::Parser;
-use client_sdk::{
-    helpers::risc0::Risc0Prover,
-    rest_client::{IndexerApiHttpClient, NodeApiHttpClient},
-};
-use conf::Conf;
-use contract1::Contract1;
+use client_sdk::{helpers::risc0::Risc0Prover, rest_client::NodeApiHttpClient};
 use hyli_modules::{
-    bus::{metrics::BusMetrics, SharedMessageBus},
+    bus::SharedMessageBus,
     modules::{
-        contract_state_indexer::{ContractStateIndexer, ContractStateIndexerCtx},
-        da_listener::{DAListener, DAListenerConf},
+        contract_listener::{ContractListener, ContractListenerConf},
         prover::{AutoProver, AutoProverCtx},
         rest::{RestApi, RestApiRunContext},
-        BuildApiContextInner, ModulesHandler,
+        BuildApiContextInner, ModulesHandler, ModulesHandlerOptions,
     },
-    utils::logger::setup_otlp,
 };
-use prometheus::Registry;
-use sdk::{api::NodeInfo, info, ZkContract};
-use std::sync::{Arc, Mutex};
-use tracing::error;
+use hyperlane_bridge::client::tx_executor_handler::TxExecutorHandler as BridgeTxHandler;
+use rpc_proxy::{HylaneRpcProxyCtx, HylaneRpcProxyModule};
+use sdk::{api::NodeInfo, ContractName, Identity};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tracing::info;
 
-mod app;
 mod conf;
 mod init;
-
-#[derive(Parser, Debug)]
-#[command(version, about, long_about = None)]
-pub struct Args {
-    #[arg(long, default_value = "config.toml")]
-    pub config_file: Vec<String>,
-
-    #[arg(long, default_value = "contract1")]
-    pub contract1_cn: String,
-
-    /// Enable tracing
-    #[arg(long, default_value = "false")]
-    pub tracing: bool,
-
-    /// Clean the data directory before starting the server
-    /// Argument used by hylix tests & run commands
-    #[arg(long, default_value = "false")]
-    pub clean_data_directory: bool,
-
-    /// Server port (overrides config)
-    /// Argument used by hylix tests commands
-    #[arg(long)]
-    pub server_port: Option<u16>,
-}
+mod rpc_proxy;
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    let args = Args::parse();
-    let config = Conf::new(args.config_file).context("reading config file")?;
-
-    setup_otlp(
-        &config.log_format,
-        format!("{}", config.id.clone()),
-        args.tracing,
-    )
-    .context("setting up tracing")?;
-
-    let config = Arc::new(config);
-
-    if args.clean_data_directory && std::fs::exists(&config.data_directory).unwrap_or(false) {
-        info!("Cleaning data directory: {:?}", &config.data_directory);
-        std::fs::remove_dir_all(&config.data_directory).context("cleaning data directory")?;
+async fn main() {
+    if let Err(e) = actual_main().await {
+        eprintln!("bridge-server failed: {e:#}");
+        std::process::exit(1);
     }
+}
 
-    info!("Starting app with config: {:?}", &config);
+async fn actual_main() -> Result<()> {
+    let args = conf::Args::parse();
+    let conf = conf::Conf::new(args.config_file).context("Reading config")?;
 
-    let node_client =
-        Arc::new(NodeApiHttpClient::new(config.node_url.clone()).context("build node client")?);
-    let indexer_client = Arc::new(
-        IndexerApiHttpClient::new(config.indexer_url.clone()).context("build indexer client")?,
+    hyli_modules::utils::logger::setup_tracing(&conf.log_format, "bridge-server".to_string())
+        .context("Setting up tracing")?;
+
+    let server_port = args.server_port.unwrap_or(conf.server_port);
+
+    info!("Starting Hyperlane Bridge Server");
+    info!("  node_url     = {}", conf.node_url);
+    info!("  server_port  = {}", server_port);
+    info!("  chain_id     = {}", conf.hyli_chain_id);
+    info!("  bridge_cn    = {}", conf.bridge_cn);
+    info!("  hyperlane_cn = {}", conf.hyperlane_cn);
+    info!("  token_cn     = {}", conf.token_cn);
+    info!("  data_dir     = {}", conf.data_directory);
+
+    let node_client = Arc::new(
+        NodeApiHttpClient::new(conf.node_url.clone()).context("Creating node HTTP client")?,
     );
 
-    let contracts = vec![init::ContractInit {
-        name: args.contract1_cn.clone().into(),
-        program_id: contract1::client::tx_executor_handler::metadata::PROGRAM_ID,
-        initial_state: Contract1::default().commit(),
-    }];
-
-    match init::init_node(node_client.clone(), indexer_client.clone(), contracts).await {
-        Ok(_) => {}
-        Err(e) => {
-            error!("Error initializing node: {:?}", e);
-            return Ok(());
-        }
+    if !conf.noinit {
+        init::init_contracts(&conf, node_client.clone()).await?;
     }
-    let bus = SharedMessageBus::new(BusMetrics::global(config.id.clone()));
 
-    std::fs::create_dir_all(&config.data_directory).context("creating data directory")?;
+    let relayer_identity = parse_relayer_identity(&conf);
 
-    let mut handler = ModulesHandler::new(&bus).await;
+    let data_dir = std::path::PathBuf::from(&conf.data_directory);
+    std::fs::create_dir_all(&data_dir).context("Creating data directory")?;
+    let bus = SharedMessageBus::new();
+
+    let mut handler =
+        ModulesHandler::new(&bus, data_dir.clone(), ModulesHandlerOptions::default())?;
 
     let api_ctx = Arc::new(BuildApiContextInner {
-        router: Mutex::new(Some(Router::new())),
+        router: std::sync::Mutex::new(Some(Router::new())),
         openapi: Default::default(),
     });
 
-    let app_ctx = Arc::new(AppModuleCtx {
-        api: api_ctx.clone(),
-        node_client,
-        contract1_cn: args.contract1_cn.clone().into(),
-    });
+    handler
+        .build_module::<HylaneRpcProxyModule>(HylaneRpcProxyCtx {
+            api: api_ctx.clone(),
+            port: server_port,
+            node_url: conf.node_url.clone(),
+            hyli_chain_id: conf.hyli_chain_id,
+            bridge_cn: ContractName(conf.bridge_cn.clone()),
+            hyperlane_cn: ContractName(conf.hyperlane_cn.clone()),
+            token_cn: ContractName(conf.token_cn.clone()),
+            relayer_identity,
+        })
+        .await?;
 
-    handler.build_module::<AppModule>(app_ctx.clone()).await?;
+    let listened_contracts = HashSet::from([conf.bridge_cn.clone().into()]);
 
     handler
-        .build_module::<ContractStateIndexer<Contract1>>(ContractStateIndexerCtx {
-            contract_name: args.contract1_cn.clone().into(),
-            data_directory: config.data_directory.clone(),
-            api: api_ctx.clone(),
+        .build_module::<ContractListener>(ContractListenerConf {
+            database_url: conf.indexer_database_url.clone(),
+            data_directory: data_dir.clone(),
+            contracts: listened_contracts,
+            poll_interval: Duration::from_secs(conf.contract_listener_poll_interval_secs),
+            replay_settled_from_start: true,
         })
         .await?;
 
     handler
-        .build_module::<AutoProver<Contract1>>(Arc::new(AutoProverCtx {
-            data_directory: config.data_directory.clone(),
+        .build_module::<AutoProver<BridgeTxHandler, Risc0Prover>>(Arc::new(AutoProverCtx {
+            data_directory: data_dir.clone(),
             prover: Arc::new(Risc0Prover::new(
-                contracts::CONTRACT1_ELF,
-                contracts::CONTRACT1_ID,
+                hyperlane_bridge::client::tx_executor_handler::metadata::HYPERLANE_BRIDGE_ELF
+                    .to_vec(),
+                hyperlane_bridge::client::tx_executor_handler::metadata::HYPERLANE_BRIDGE_PROGRAM_ID,
             )),
-            contract_name: args.contract1_cn.clone().into(),
-            node: app_ctx.node_client.clone(),
-            default_state: Default::default(),
-            buffer_blocks: config.buffer_blocks,
-            max_txs_per_proof: config.max_txs_per_proof,
-            tx_working_window_size: config.tx_working_window_size,
+            contract_name: conf.bridge_cn.clone().into(),
+            node: node_client.clone(),
             api: Some(api_ctx.clone()),
+            tx_buffer_size: conf.prover_tx_buffer_size,
+            max_txs_per_proof: conf.prover_max_txs_per_proof,
+            tx_working_window_size: conf.prover_tx_working_window_size,
+            idle_flush_interval: Duration::from_secs(conf.prover_idle_flush_interval_secs),
         }))
         .await?;
 
-    // This module connects to the da_address and receives all the blocks²
-    handler
-        .build_module::<DAListener>(DAListenerConf {
-            start_block: None,
-            data_directory: config.data_directory.clone(),
-            da_read_from: config.da_read_from.clone(),
-            timeout_client_secs: 10,
-        })
-        .await?;
+    info!(
+        "ContractListener and AutoProver modules started for '{}'",
+        conf.bridge_cn
+    );
 
     // Should come last so the other modules have nested their own routes.
     #[allow(clippy::expect_used, reason = "Fail on misconfiguration")]
@@ -162,24 +133,36 @@ async fn main() -> Result<()> {
         .clone();
 
     handler
-        .build_module::<RestApi>(RestApiRunContext {
-            port: args.server_port.unwrap_or(config.rest_server_port),
-            max_body_size: config.rest_server_max_body_size,
-            registry: Registry::new(),
-            router,
-            openapi,
-            info: NodeInfo {
-                id: config.id.clone(),
-                da_address: config.da_read_from.clone(),
+        .build_module::<RestApi>(RestApiRunContext::new(
+            args.server_port.unwrap_or(conf.server_port),
+            NodeInfo {
+                id: "bridge-server".to_string(),
                 pubkey: None,
+                da_address: String::new(),
             },
-        })
+            router,
+            10 * 1024 * 1024,
+            openapi,
+        ))
         .await?;
 
-    handler.start_modules().await?;
-
-    // Run until shut down or an error occurs
+    _ = handler.start_modules().await;
     handler.exit_process().await?;
 
     Ok(())
+}
+
+fn parse_relayer_identity(conf: &conf::Conf) -> Identity {
+    if let Some(key_hex) = &conf.relayer_key {
+        let key_hex = key_hex.trim_start_matches("0x");
+        if let Ok(key_bytes) = hex::decode(key_hex) {
+            if let Ok(sk) = k256::ecdsa::SigningKey::from_slice(&key_bytes) {
+                let vk = sk.verifying_key();
+                let pk_bytes = vk.to_encoded_point(true);
+                let pk_hex = hex::encode(pk_bytes.as_bytes());
+                return Identity(format!("0x{pk_hex}@hyperlane-bridge"));
+            }
+        }
+    }
+    Identity("relayer@hyperlane-bridge".to_string())
 }

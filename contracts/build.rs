@@ -2,12 +2,12 @@
 #[cfg(any(clippy, not(feature = "build")))]
 fn main() {}
 
-#[cfg(all(feature = "build", not(any(feature = "contract1"))))]
+#[cfg(all(feature = "build", not(any(feature = "hyperlane-bridge"))))]
 fn main() {
-    compile_error!("When the 'build' feature is enabled, at least one of the following features must also be enabled: all, contract1.");
+    compile_error!("When the 'build' feature is enabled, at least one of the following features must also be enabled: all, hyperlane-bridge.");
 }
 
-#[cfg(all(not(clippy), feature = "build", feature = "contract1"))]
+#[cfg(all(not(clippy), feature = "build"))]
 fn main() {
     trait CodegenConsts {
         fn codegen_consts(&self) -> String;
@@ -53,8 +53,8 @@ fn main() {
     let manifest_dir = pkg.manifest_path.parent().unwrap();
 
     let methods: Vec<GuestListEntry> = [
-        #[cfg(feature = "contract1")]
-        "contract1",
+        #[cfg(feature = "hyperlane-bridge")]
+        "hyperlane-bridge",
     ]
     .iter()
     .map(|name| {

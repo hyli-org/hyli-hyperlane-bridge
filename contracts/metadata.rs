@@ -6,15 +6,17 @@ mod methods {
 
 #[cfg(all(not(clippy), feature = "nonreproducible", feature = "all"))]
 mod metadata {
-    pub const CONTRACT1_ELF: &[u8] = crate::methods::CONTRACT1_ELF;
-    pub const CONTRACT1_ID: [u8; 32] = sdk::to_u8_array(&crate::methods::CONTRACT1_ID);
+    pub const HYPERLANE_BRIDGE_ELF: &[u8] = crate::methods::HYPERLANE_BRIDGE_ELF;
+    pub const HYPERLANE_BRIDGE_ID: [u8; 32] =
+        sdk::to_u8_array(&crate::methods::HYPERLANE_BRIDGE_ID);
 }
 
 #[cfg(any(clippy, not(feature = "nonreproducible")))]
 mod metadata {
-    pub const CONTRACT1_ELF: &[u8] =
-        contract1::client::tx_executor_handler::metadata::CONTRACT1_ELF;
-    pub const CONTRACT1_ID: [u8; 32] = contract1::client::tx_executor_handler::metadata::PROGRAM_ID;
+    pub const HYPERLANE_BRIDGE_ELF: &[u8] =
+        hyperlane_bridge::client::tx_executor_handler::metadata::HYPERLANE_BRIDGE_ELF;
+    pub const HYPERLANE_BRIDGE_ID: [u8; 32] =
+        hyperlane_bridge::client::tx_executor_handler::metadata::HYPERLANE_BRIDGE_PROGRAM_ID;
 }
 
 pub use metadata::*;

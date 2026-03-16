@@ -1,16 +1,28 @@
 [workspace]
 resolver = "2"
-members = ["contracts", "contracts/contract1", "server"]
+members = ["contracts", "contracts/hyperlane-bridge", "server"]
 
 [workspace.dependencies]
-sdk = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-contract-sdk", tag = "v0.14.1" }
-client-sdk = { git = "https://github.com/hyli-org/hyli.git", default-features = false, package = "hyli-client-sdk", tag = "v0.14.1" }
-hyli-smt-token = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-smt-token", tag = "v0.14.1" }
-hyli-modules = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-modules", tag = "v0.14.1" }
+sdk = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-contract-sdk", branch = "main" }
+client-sdk = { git = "https://github.com/hyli-org/hyli.git", default-features = false, package = "hyli-client-sdk", branch = "main" }
+hyli-smt-token = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-smt-token", branch = "main" }
+smt-token = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-smt-token", branch = "main" }
+hyli-modules = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-modules", branch = "main" }
+hyli-net = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-net", branch = "main" }
+hyli-model = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-model", branch = "main" }
 
 contracts = { path = "contracts", default-features = false, package = "contracts" }
-contract1 = { path = "contracts/contract1", package = "contract1" }
-anyhow = "1.0.96"
+hyperlane-bridge = { path = "contracts/hyperlane-bridge", default-features = false, package = "hyli-hyperlane-bridge" }
+
+alloy-tx-macros = { version = "=1.6.3", default-features = false }
+alloy-consensus = { version = "1.1.0", default-features = false }
+alloy-eips = { version = "=1.6.3", default-features = false }
+alloy-primitives = { version = "1.4.1", default-features = false }
+alloy-sol-types = { version = "1.5", default-features = false }
+
+k256 = { version = "0.13", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+anyhow = "1.0.102"
 axum = "0.8.3"
 borsh = "1.6.0"
 clap = "4.5.28"
