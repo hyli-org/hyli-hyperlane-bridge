@@ -3011,10 +3011,7 @@ dependencies = [
  "risc0-zkvm",
  "serde",
  "serde_json",
- "tokio",
  "tracing",
- "utoipa",
- "utoipa-axum",
 ]
 
 [[package]]
@@ -3028,7 +3025,6 @@ dependencies = [
  "serde",
  "sha2",
  "sparse-merkle-tree",
- "tracing",
 ]
 
 [[package]]
@@ -3065,7 +3061,6 @@ dependencies = [
  "hyli-model",
  "hyli-modules",
  "hyli-net",
- "hyli-smt-token",
  "k256",
  "opentelemetry",
  "reqwest 0.12.28",
@@ -3212,7 +3207,6 @@ source = "git+https://github.com/hyli-org/hyli.git?branch=main#947b68a6674df7f30
 dependencies = [
  "anyhow",
  "borsh",
- "hyli-client-sdk",
  "hyli-contract-sdk",
  "serde",
  "sha2",

@@ -44,7 +44,6 @@ async fn actual_main() -> Result<()> {
     info!("  chain_id     = {}", conf.hyli_chain_id);
     info!("  bridge_cn    = {}", conf.bridge_cn);
     info!("  hyperlane_cn = {}", conf.hyperlane_cn);
-    info!("  token_cn     = {}", conf.token_cn);
     info!("  data_dir     = {}", conf.data_directory);
 
     let node_client = Arc::new(
@@ -77,7 +76,6 @@ async fn actual_main() -> Result<()> {
             hyli_chain_id: conf.hyli_chain_id,
             bridge_cn: ContractName(conf.bridge_cn.clone()),
             hyperlane_cn: ContractName(conf.hyperlane_cn.clone()),
-            token_cn: ContractName(conf.token_cn.clone()),
             relayer_identity,
         })
         .await?;

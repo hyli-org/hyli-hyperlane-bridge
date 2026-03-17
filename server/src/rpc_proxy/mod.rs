@@ -26,7 +26,6 @@ pub struct HylaneRpcProxyCtx {
     pub hyli_chain_id: u64,
     pub bridge_cn: ContractName,
     pub hyperlane_cn: ContractName,
-    pub token_cn: ContractName,
     pub relayer_identity: sdk::Identity,
     pub api: Arc<BuildApiContextInner>,
 }
@@ -45,7 +44,6 @@ impl Module for HylaneRpcProxyModule {
             ctx.hyli_chain_id,
             ctx.bridge_cn,
             ctx.hyperlane_cn,
-            ctx.token_cn,
             ctx.relayer_identity,
         )
         .context("Building RPC proxy router context")?;

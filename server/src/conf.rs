@@ -32,7 +32,6 @@ pub struct Conf {
     pub eth_state_root: String,
     pub bridge_cn: String,
     pub hyperlane_cn: String,
-    pub token_cn: String,
     /// Hex-encoded secp256k1 private key used to sign Hyli transactions (relayer path)
     pub relayer_key: Option<String>,
     /// Directory name to store module state

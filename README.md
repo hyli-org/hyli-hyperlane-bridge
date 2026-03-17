@@ -28,16 +28,17 @@ The system has two contracts and one server process.
 | Contract | Verifier | State | Purpose |
 |---|---|---|---|
 | `hyperlane` | `reth` | Current Ethereum state root (32 bytes) | A self-contained EVM chain on Hyli; each proven tx advances it by one Ethereum block |
-| `hyperlane-bridge` | `risc0-3` | SHA-256(hyperlane_cn \|\| token_cn) | ZK bridge logic: validates cross-chain token transfers |
+| `hyperlane-bridge` | `risc0-3` | SHA-256(hyperlane_cn) | Policy guard: inspects EVM transactions and enforces chain-level rules |
 
 **`hyperlane` contract** (`reth` verifier)
 This is an EVM blockchain running inside Hyli. Its genesis state root is set to the configured `eth_state_root` at registration time. Every blob transaction that touches this contract must contain a raw EIP-2718 Ethereum transaction as its blob data, together with a proof that bundles a `StatelessInput` (a single-transaction Ethereum block + execution witness) and the chain spec. The verifier runs full stateless EVM execution, checks all receipts succeeded, and transitions the state root from `parent_header.state_root` to `block.header.state_root`. This is how the bridge proves that a `WarpRoute.transferRemote` or `Mailbox.process` call actually executed on an EVM — the EVM execution happens inside the proof, not on any external node.
 
 **`hyperlane-bridge` contract** (`risc0-3` verifier)
-Implements the bridge logic, proven with RISC0. It has two actions:
+A policy guard that runs alongside every reth blob transaction. It has a single action:
 
-- `TransferRemote { eth_recipient, amount }` — Hyli → Ethereum path. Verifies that a `smt-token Transfer` to the bridge reserve matches the `amount` in the reth blob's `transferRemote` call.
-- `ProcessMessage` — Ethereum → Hyli path. Decodes the `Mailbox.process` call from the reth blob to extract `(recipient, amount)`, then asserts the callee `smt-token Transfer` releases exactly that amount from the bridge to the recipient.
+- `VerifyTransaction` — reads the EVM transaction from the companion reth blob and enforces chain-level rules. Current policy: **reject contract deployments** (CREATE transactions are not allowed). Future: will also gate EVM-to-Hyli token bridging, so that tokens can be released into native Hyli contracts when the EVM transaction authorises it.
+
+The bridge logic itself (Mailbox, WarpRoute, ISM, token accounting) lives entirely inside the EVM state of the `hyperlane` reth contract as Solidity contracts — exactly as it would on any real EVM chain bridged via Hyperlane. The `hyperlane-bridge` RISC0 contract does not re-implement that logic; it only inspects and guards it.
 
 ### Server
 
@@ -52,36 +53,44 @@ A Rust async server (`bridge-server`) composed of four modules:
 
 ## Data Flows
 
-### Hyli → Ethereum (`TransferRemote`)
+Every Hyli blob transaction touching the EVM chain has the same two-blob structure:
+
+```
+blob[0]: hyperlane reth blob  ← raw EIP-2718 ETH tx (proven by reth verifier)
+blob[1]: hyperlane-bridge blob ← VerifyTransaction   (proven by RISC0)
+```
+
+The reth proof advances the EVM chain state root. The RISC0 proof checks the policy rules. Both must succeed for the transaction to be accepted.
+
+### Hyli → Ethereum (`WarpRoute.transferRemote`)
 
 ```
 User
  │
- ├─ sends blob tx with 3 blobs:
- │    blob[0]: hyperlane reth blob  ← raw EIP-2718 ETH tx calling WarpRoute.transferRemote(dest, recipient, amount)
- │    blob[1]: hyperlane-bridge blob ← TransferRemote { eth_recipient, amount }
- │    blob[2]: smt-token blob        ← Transfer { sender: user, recipient: "hyperlane-bridge", amount }
+ ├─ sends 2-blob tx:
+ │    blob[0]: reth blob  ← EIP-2718 tx calling WarpRoute.transferRemote(dest, recipient, amount)
+ │    blob[1]: bridge blob ← VerifyTransaction
  │
  ▼
 Hyli node
- │
- ├─ AutoProver generates RISC0 proof for blob[1]:
- │    • checks blob[2]: smt-token Transfer to "hyperlane-bridge" with correct amount ✓
- │    • checks blob[0]: reth blob encodes transferRemote with matching amount ✓
+ ├─ reth verifier: runs stateless EVM block execution, advances EVM state root
+ │    WarpRoute.transferRemote() executes inside the EVM, emits Dispatch event ✓
+ ├─ RISC0: VerifyTransaction checks the reth blob is not a CREATE tx ✓
  │
  ▼
 Hyperlane relayer
  │
- ├─ polls eth_getLogs on RPC proxy → receives synthetic Dispatch log
- │    (built from the TransferRemote parameters in the bridge blob)
+ ├─ polls eth_getLogs on RPC proxy
+ │    → proxy scans proven reth blobs for transferRemote calldata
+ │    → synthesizes Dispatch event log from the calldata parameters
  │
  ├─ delivers proof to Ethereum Mailbox.process()
  │
  ▼
-Ethereum: tokens released to eth_recipient
+Ethereum: WarpRoute releases tokens to eth_recipient
 ```
 
-### Ethereum → Hyli (`ProcessMessage`)
+### Ethereum → Hyli (`Mailbox.process`)
 
 ```
 Hyperlane relayer
@@ -92,22 +101,22 @@ Hyperlane relayer
  ▼
 RPC proxy (eth_send_raw_transaction handler)
  │
- ├─ decodes Mailbox.process calldata → extracts (hyli_recipient, amount) from TokenMessage body
+ ├─ validates the bytes decode as a valid EIP-2718 transaction
  │
- ├─ builds 3-blob transaction:
- │    blob[0]: hyperlane reth blob  ← the original raw EIP-2718 bytes
- │    blob[1]: hyperlane-bridge blob ← ProcessMessage
- │    blob[2]: smt-token blob        ← Transfer { sender: "hyperlane-bridge", recipient, amount }
+ ├─ builds 2-blob transaction:
+ │    blob[0]: reth blob  ← the original raw EIP-2718 bytes
+ │    blob[1]: bridge blob ← VerifyTransaction
  │
  ├─ submits to Hyli node
  │
  ▼
-AutoProver generates RISC0 proof for blob[1]:
- │    • decodes reth blob → extracts (recipient, amount) from Mailbox.process message ✓
- │    • checks callee blob[2]: smt-token Transfer from bridge to recipient, exact amount ✓
+Hyli node
+ ├─ reth verifier: runs stateless EVM block execution, advances EVM state root
+ │    Mailbox.process() executes inside the EVM, WarpRoute mints/releases tokens ✓
+ ├─ RISC0: VerifyTransaction checks the reth blob is not a CREATE tx ✓
  │
  ▼
-Hyli: tokens released to hyli_recipient
+EVM state updated: tokens credited to recipient inside the EVM chain
 ```
 
 ---
@@ -120,8 +129,8 @@ An Ethereum JSON-RPC endpoint that the Hyperlane relayer connects to instead of 
 
 | RPC method | Behavior |
 |---|---|
-| `eth_sendRawTransaction` | Decodes `Mailbox.process` call, builds 3-blob Hyli tx, submits to node |
-| `eth_getLogs` | Scans indexer for `TransferRemote` bridge txs, synthesizes `Dispatch` event logs |
+| `eth_sendRawTransaction` | Wraps the raw EIP-2718 tx in a 2-blob Hyli tx (reth + bridge), submits to node |
+| `eth_getLogs` | Scans proven reth blobs for `transferRemote` calldata, synthesizes `Dispatch` event logs |
 | `eth_blockNumber` | Proxies Hyli block height |
 | `eth_chainId` / `net_version` | Returns configured `hyli_chain_id` |
 | `eth_getBlockByNumber` | Returns Hyli block data in Ethereum block format |
@@ -130,7 +139,7 @@ An Ethereum JSON-RPC endpoint that the Hyperlane relayer connects to instead of 
 
 ### `ContractListener` (`hyli-modules`)
 
-Polls the indexer PostgreSQL database on a configurable interval for new transactions involving the bridge contract. Publishes them to the shared bus for the AutoProver to consume.
+Polls the indexer PostgreSQL database on a configurable interval for new transactions involving the `hyperlane-bridge` contract. Publishes them to the shared bus for the AutoProver to consume.
 
 ### `AutoProver<BridgeTxHandler, Risc0Prover>` (`hyli-modules`)
 
@@ -155,7 +164,7 @@ Configuration is read from a TOML file (default: `bridge-server.toml`), with `BR
 | `eth_state_root` | `000...000` | 32-byte hex Ethereum state root to initialize the `hyperlane` contract |
 | `bridge_cn` | `hyperlane-bridge` | Hyli contract name for the bridge contract |
 | `hyperlane_cn` | `hyperlane` | Hyli contract name for the reth/Ethereum state contract |
-| `token_cn` | `oranj` | Hyli contract name for the smt-token |
+| `token_cn` | `oranj` | Reserved for future EVM-to-Hyli token bridging |
 | `relayer_key` | _(none)_ | Hex secp256k1 private key used to sign Hyli transactions; if absent uses `relayer@hyperlane-bridge` |
 | `data_directory` | `data/bridge-server` | Directory for module state files |
 | `noinit` | `false` | Skip contract registration on startup |
@@ -207,6 +216,6 @@ BRIDGE_ETH_STATE_ROOT=<32-byte-hex-root> \
 On first startup (when `noinit = false`), the server registers both contracts if they do not already exist:
 
 1. **`hyperlane`** — registered with the `reth` verifier, program ID `[0u8; 65]` (no specific signer check), and initial state = the configured `eth_state_root`. This seeds the genesis of the EVM chain; subsequent proven blob transactions advance the state root one block at a time.
-2. **`hyperlane-bridge`** — registered with the `risc0-3` verifier, program ID from the compiled ELF, and initial state = SHA-256(`hyperlane_cn` || `token_cn`).
+2. **`hyperlane-bridge`** — registered with the `risc0-3` verifier, program ID from the compiled ELF, and initial state = SHA-256(`hyperlane_cn`).
 
-The bridge contract's state never changes after initialization (its commit is a hash of the two companion contract names). The hyperlane contract's state root advances as Ethereum blocks are proven.
+The bridge contract's state never changes after initialization (its commit is a hash of the companion reth contract name). The hyperlane contract's state root advances one block at a time as EVM transactions are proven.

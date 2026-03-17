@@ -10,17 +10,14 @@ use std::sync::Arc;
 
 use crate::rpc_proxy::types::JsonRpcResponse;
 use hyperlane_bridge::{
-    client::TxExecutorHandler, processCall, HyperlaneBridgeAction, HyperlaneBridgeState,
-    BRIDGE_CONTRACT_NAME,
+    client::TxExecutorHandler, transferRemoteCall, HyperlaneBridgeState, BRIDGE_CONTRACT_NAME,
 };
-use smt_token::client::tx_executor_handler::SmtTokenProvableState;
 
 #[derive(Clone)]
 pub struct RouterCtx {
     pub hyli_chain_id: u64,
     pub bridge_cn: ContractName,
     pub hyperlane_cn: ContractName,
-    pub token_cn: ContractName,
     pub relayer_identity: Identity,
     pub node_client: Arc<NodeApiHttpClient>,
     pub indexer_client: Arc<IndexerApiHttpClient>,
@@ -32,7 +29,6 @@ impl RouterCtx {
         hyli_chain_id: u64,
         bridge_cn: ContractName,
         hyperlane_cn: ContractName,
-        token_cn: ContractName,
         relayer_identity: Identity,
     ) -> Result<Self> {
         let node_client = Arc::new(NodeApiHttpClient::new(node_url.clone())?);
@@ -41,7 +37,6 @@ impl RouterCtx {
             hyli_chain_id,
             bridge_cn,
             hyperlane_cn,
-            token_cn,
             relayer_identity,
             node_client,
             indexer_client,
@@ -141,7 +136,6 @@ pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
         .and_then(|v| v.as_str())
         .unwrap_or("latest");
 
-    // Fetch latest block height for "latest" resolution
     let latest_height = match ctx.indexer_client.get_last_block().await {
         Ok(b) => b.height,
         Err(e) => {
@@ -151,17 +145,18 @@ pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
 
     let to_block = parse_block_number(Some(to_block_tag), latest_height);
 
-    // Fetch all blob transactions for the bridge contract
+    // Fetch all blob transactions for the hyperlane reth contract.
+    // Each proven reth blob is one EVM transaction on the Hyli-hosted EVM chain.
     let txs = match ctx
         .indexer_client
-        .get_blob_transactions_by_contract(&ctx.bridge_cn)
+        .get_blob_transactions_by_contract(&ctx.hyperlane_cn)
         .await
     {
         Ok(t) => t,
         Err(e) => {
             return JsonRpcResponse::internal_error(
                 id,
-                format!("Failed to query bridge transactions: {e}"),
+                format!("Failed to query hyperlane transactions: {e}"),
             )
         }
     };
@@ -175,27 +170,27 @@ pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
             continue;
         }
 
-        // Check if this tx contains a TransferRemote action blob
-        let transfer_remote_blob = tx
-            .blobs
-            .iter()
-            .find(|b| b.contract_name == ctx.bridge_cn.0 && is_transfer_remote_blob(&b.data));
+        // Find a reth blob whose EVM transaction calls transferRemote.
+        let transfer_remote_blob = tx.blobs.iter().find(|b| {
+            b.contract_name == ctx.hyperlane_cn.0 && is_transfer_remote_reth_blob(&b.data)
+        });
 
-        let Some(bridge_blob) = transfer_remote_blob else {
+        let Some(reth_blob) = transfer_remote_blob else {
             continue;
         };
 
-        // Parse TransferRemote parameters from the bridge blob
-        let Some((eth_recipient, amount, destination)) = parse_transfer_remote(&bridge_blob.data)
+        // Parse transferRemote parameters directly from the reth blob.
+        let Some((eth_recipient, amount, destination)) =
+            parse_transfer_remote_from_reth_blob(&reth_blob.data)
         else {
             continue;
         };
 
-        // Build Hyperlane message bytes
+        // Build Hyperlane message bytes.
         let origin = (ctx.hyli_chain_id & 0xFFFF_FFFF) as u32;
         let nonce = (log_index & 0xFFFF_FFFF) as u32;
 
-        // Sender: bridge contract name as 32-byte left-padded string
+        // Sender: bridge contract name as 32-byte right-padded string.
         let mut sender_bytes = [0u8; 32];
         let bridge_name = BRIDGE_CONTRACT_NAME.as_bytes();
         let copy_len = bridge_name.len().min(32);
@@ -211,9 +206,8 @@ pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
             amount,
         );
 
-        // Build log topics
         let mut sender_topic = [0u8; 32];
-        sender_topic[12..].copy_from_slice(&sender_bytes[20..32]); // address (last 20 bytes)
+        sender_topic[12..].copy_from_slice(&sender_bytes[20..32]);
 
         let mut dest_topic = [0u8; 32];
         dest_topic[28..32].copy_from_slice(&destination.to_be_bytes());
@@ -256,36 +250,39 @@ fn parse_block_number(tag: Option<&str>, latest: u64) -> u64 {
     }
 }
 
-/// Check if a blob's data encodes a TransferRemote action.
-fn is_transfer_remote_blob(data: &[u8]) -> bool {
-    if let Ok(structured) =
-        sdk::StructuredBlobData::<HyperlaneBridgeAction>::try_from(sdk::BlobData(data.to_vec()))
-    {
-        matches!(
-            structured.parameters,
-            HyperlaneBridgeAction::TransferRemote { .. }
-        )
-    } else {
-        false
-    }
+/// Check if a reth blob's EVM transaction calls `WarpRoute.transferRemote`.
+fn is_transfer_remote_reth_blob(data: &[u8]) -> bool {
+    let Some(tx) = decode_blob_as_tx(data) else {
+        return false;
+    };
+    let input = extract_tx_input(&tx);
+    input.len() >= 4 && input.starts_with(&transferRemoteCall::SELECTOR)
 }
 
-/// Extract (eth_recipient, amount, destination_domain) from a bridge blob.
-fn parse_transfer_remote(data: &[u8]) -> Option<([u8; 32], u128, u32)> {
-    let structured =
-        sdk::StructuredBlobData::<HyperlaneBridgeAction>::try_from(sdk::BlobData(data.to_vec()))
-            .ok()?;
-    if let HyperlaneBridgeAction::TransferRemote {
-        eth_recipient,
-        amount,
-    } = structured.parameters
-    {
-        // Destination domain is not stored in the bridge blob; we derive it from the reth blob
-        // if available. For the log synthesis we use 0 as a placeholder destination.
-        Some((eth_recipient, amount, 0))
-    } else {
-        None
+/// Extract `(eth_recipient, amount, destination_domain)` from a reth blob whose
+/// EVM transaction calls `WarpRoute.transferRemote`.
+fn parse_transfer_remote_from_reth_blob(data: &[u8]) -> Option<([u8; 32], u128, u32)> {
+    let tx = decode_blob_as_tx(data)?;
+    let input = extract_tx_input(&tx);
+    if input.len() < 4 || !input.starts_with(&transferRemoteCall::SELECTOR) {
+        return None;
     }
+    let decoded = transferRemoteCall::abi_decode_raw(&input[4..]).ok()?;
+    let amount: u128 = u128::try_from(decoded.amount).ok()?;
+    let recipient: [u8; 32] = decoded.recipient.into();
+    Some((recipient, amount, decoded.destination))
+}
+
+/// Decode a reth blob's raw bytes (stripping any StructuredBlobData wrapper) into a TxEnvelope.
+fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
+    let raw_bytes = if let Ok(structured) =
+        sdk::StructuredBlobData::<Vec<u8>>::try_from(sdk::BlobData(data.to_vec()))
+    {
+        structured.parameters
+    } else {
+        data.to_vec()
+    };
+    TxEnvelope::decode_2718(&mut raw_bytes.as_slice()).ok()
 }
 
 /// Build a Hyperlane message byte string.
@@ -306,7 +303,7 @@ fn build_hyperlane_message(
     msg.extend_from_slice(&destination.to_be_bytes());
     msg.extend_from_slice(&recipient);
     // Body: token recipient (32 bytes) + amount (32 bytes, big-endian)
-    msg.extend_from_slice(&recipient); // token recipient = same as message recipient
+    msg.extend_from_slice(&recipient);
     let mut amount_bytes = [0u8; 32];
     amount_bytes[16..].copy_from_slice(&amount.to_be_bytes());
     msg.extend_from_slice(&amount_bytes);
@@ -333,7 +330,6 @@ pub async fn eth_call(_ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
     // latestCheckpoint() -> (bytes32, uint32) stub
     let latest_checkpoint_sel = &keccak256("latestCheckpoint()")[..4];
     if selector == latest_checkpoint_sel {
-        // Return (bytes32(0), uint32(0)) ABI-encoded (64 bytes)
         return JsonRpcResponse::ok(id, json!(format!("0x{}", "0".repeat(128))));
     }
 
@@ -346,18 +342,16 @@ pub async fn eth_call(_ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
         );
     }
 
-    // Default: return empty
     JsonRpcResponse::ok(id, json!("0x"))
 }
 
-// ── eth_sendRawTransaction / eth_sendTransaction ──────────────────────────────
+// ── eth_sendRawTransaction ────────────────────────────────────────────────────
 
 pub async fn eth_send_raw_transaction(
     ctx: &RouterCtx,
     id: Value,
     params: &Value,
 ) -> JsonRpcResponse {
-    // params[0] is either a hex-encoded EIP-2718 transaction or an object with "data"
     let raw_hex = if let Some(s) = params.get(0).and_then(|v| v.as_str()) {
         s.trim_start_matches("0x").to_string()
     } else if let Some(data) = params
@@ -375,81 +369,35 @@ pub async fn eth_send_raw_transaction(
         Err(e) => return JsonRpcResponse::err(id, -32602, format!("Invalid hex: {e}")),
     };
 
-    // Decode EIP-2718 transaction
-    let tx = match TxEnvelope::decode_2718(&mut raw_bytes.as_slice()) {
-        Ok(t) => t,
-        Err(e) => {
-            return JsonRpcResponse::err(
-                id,
-                -32602,
-                format!("Failed to decode EIP-2718 transaction: {e}"),
-            )
-        }
-    };
-
-    // Extract (recipient, amount) from the process() calldata
-    let input = extract_tx_input(&tx);
-    if input.len() < 4 || !input.starts_with(&processCall::SELECTOR) {
-        return JsonRpcResponse::err(
-            id,
-            -32602,
-            "Transaction does not call Mailbox.process(bytes,bytes)",
-        );
+    // Validate the bytes decode as a valid EIP-2718 transaction.
+    if TxEnvelope::decode_2718(&mut raw_bytes.as_slice()).is_err() {
+        return JsonRpcResponse::err(id, -32602, "Failed to decode EIP-2718 transaction");
     }
 
-    let decoded = match processCall::abi_decode_raw(&input[4..]) {
-        Ok(d) => d,
-        Err(e) => {
-            return JsonRpcResponse::err(id, -32602, format!("Failed to ABI-decode process: {e}"))
-        }
-    };
-
-    let message: &[u8] = decoded.message.as_ref();
-    const HEADER_LEN: usize = 77;
-    if message.len() < HEADER_LEN + 64 {
-        return JsonRpcResponse::err(
-            id,
-            -32602,
-            "Hyperlane message too short to contain TokenMessage",
-        );
-    }
-    let body = &message[HEADER_LEN..];
-    let mut recipient_bytes = [0u8; 32];
-    recipient_bytes.copy_from_slice(&body[..32]);
-    let mut amount_bytes = [0u8; 16];
-    amount_bytes.copy_from_slice(&body[48..64]);
-    let amount = u128::from_be_bytes(amount_bytes);
-
-    // Convert recipient bytes to Hyli Identity
-    let end = recipient_bytes
-        .iter()
-        .rposition(|&b| b != 0)
-        .map(|i| i + 1)
-        .unwrap_or(0);
-    let recipient = Identity(String::from_utf8_lossy(&recipient_bytes[..end]).into_owned());
-
-    // Build the Hyli blob transaction
-    let bridge_state = HyperlaneBridgeState {
-        hyperlane_contract: ctx.hyperlane_cn.clone(),
-        token_contract: ctx.token_cn.clone(),
-    };
+    // Build the Hyli blob transaction:
+    //   blob[0]: hyperlane reth blob  ← raw EIP-2718 bytes (proven by reth verifier)
+    //   blob[1]: hyperlane-bridge blob ← VerifyTransaction (proven by RISC0)
     let handler = TxExecutorHandler {
-        state: bridge_state,
-        smt_executor: SmtTokenProvableState::default(),
+        state: HyperlaneBridgeState {
+            hyperlane_contract: ctx.hyperlane_cn.clone(),
+        },
     };
 
     let mut builder =
         client_sdk::transaction_builder::ProvableBlobTx::new(ctx.relayer_identity.clone());
 
-    // Blob 0: hyperlane reth blob (raw EIP-2718 bytes)
+    // Blob 0: reth blob (raw EIP-2718 bytes).
     builder.blobs.push(Blob {
         contract_name: ctx.hyperlane_cn.clone(),
         data: BlobData(raw_bytes.clone()),
     });
 
-    // Blobs 1+2: bridge ProcessMessage + smt-token Transfer
-    if let Err(e) = handler.process_message(&mut builder, recipient, amount) {
-        return JsonRpcResponse::internal_error(id, format!("Failed to build process blobs: {e}"));
+    // Blob 1: bridge VerifyTransaction.
+    if let Err(e) = handler.verify_transaction(&mut builder) {
+        return JsonRpcResponse::internal_error(
+            id,
+            format!("Failed to build verify_transaction blob: {e}"),
+        );
     }
 
     let blob_tx = BlobTransaction::new(builder.identity, builder.blobs);
@@ -458,7 +406,6 @@ pub async fn eth_send_raw_transaction(
         Err(e) => return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}")),
     };
 
-    // Return as a 32-byte Ethereum-style tx hash
     let hash_str = tx_hash.to_string();
     let padded = if hash_str.len() < 64 {
         format!("{:0>64}", hash_str)
@@ -480,7 +427,6 @@ pub async fn eth_get_transaction_receipt(
         None => return JsonRpcResponse::ok(id, Value::Null),
     };
 
-    // Attempt to find the transaction by hash in the indexer
     let tx_hash = match hex::decode(hash_hex).map(sdk::TxHash) {
         Ok(h) => h,
         Err(_) => return JsonRpcResponse::ok(id, Value::Null),
@@ -492,7 +438,6 @@ pub async fn eth_get_transaction_receipt(
                 sdk::api::TransactionStatusDb::Success => "0x1",
                 sdk::api::TransactionStatusDb::Failure => "0x0",
                 _ => {
-                    // Still pending
                     return JsonRpcResponse::ok(id, Value::Null);
                 }
             };

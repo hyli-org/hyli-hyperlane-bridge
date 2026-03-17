@@ -5,7 +5,6 @@ hyli_chain_id = 1337
 eth_state_root = "0000000000000000000000000000000000000000000000000000000000000000"
 bridge_cn = "hyperlane-bridge"
 hyperlane_cn = "hyperlane"
-token_cn = "oranj"
 data_directory = "data/bridge-server"
 noinit = false
 

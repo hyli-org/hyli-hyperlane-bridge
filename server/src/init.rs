@@ -36,7 +36,6 @@ pub async fn init_contracts(conf: &Conf, node: Arc<NodeApiHttpClient>) -> Result
     // ── Contract A: HyperlaneBridgeState (risc0) ──────────────────────────────
     let bridge_state = HyperlaneBridgeState {
         hyperlane_contract: hyperlane_cn.clone(),
-        token_contract: ContractName(conf.token_cn.clone()),
     };
 
     match node.get_contract(bridge_cn.clone()).await {

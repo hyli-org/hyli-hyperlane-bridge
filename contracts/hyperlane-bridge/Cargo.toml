@@ -19,7 +19,6 @@ test = false
 
 [dependencies]
 sdk = { workspace = true }
-smt-token = { workspace = true }
 borsh = { workspace = true, features = ["derive"] }
 alloy-primitives = { workspace = true }
 alloy-consensus = { workspace = true }
@@ -57,7 +56,6 @@ default = []
 client = [
   "dep:client-sdk",
   "client-sdk/risc0",
-  "smt-token/client",
   "sdk/full-model",
 ]
 risc0 = ["dep:risc0-zkvm", "sdk/risc0"]
