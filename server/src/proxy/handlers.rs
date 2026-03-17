@@ -8,8 +8,8 @@ use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
 use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
 
-use crate::rpc_proxy::eth_chain_state::EthChainState;
-use crate::rpc_proxy::types::JsonRpcResponse;
+use crate::proxy::eth_chain_state::EthChainState;
+use crate::proxy::types::JsonRpcResponse;
 use hyperlane_bridge::{transferRemoteCall, HyperlaneBridgeAction};
 
 #[derive(Clone)]

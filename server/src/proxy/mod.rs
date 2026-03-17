@@ -30,7 +30,7 @@ module_bus_client! {
     }
 }
 
-pub struct HylaneRpcProxyCtx {
+pub struct HyperlaneProverCtx {
     pub port: u16,
     pub node_url: String,
     pub hyli_chain_id: u64,
@@ -45,13 +45,11 @@ pub struct HylaneRpcProxyCtx {
     pub evm_config_json: Vec<u8>,
 }
 
-pub struct HylaneRpcProxyModule {
+pub struct HyperlaneProverModule {
     port: u16,
     bus: RpcProxyBusClient,
     node_client: Arc<client_sdk::rest_client::NodeApiHttpClient>,
     hyperlane_cn: ContractName,
-    /// Program ID derived from `bridge_cn`, used when submitting ProofTransactions for
-    /// the hyperlane reth contract (matches `init.rs::derive_program_pubkey`).
     hyperlane_program_id: ProgramId,
     evm_config_json: Vec<u8>,
     eth_chain_state: Arc<RwLock<EthChainState>>,
@@ -59,8 +57,8 @@ pub struct HylaneRpcProxyModule {
     catching_up: bool,
 }
 
-impl Module for HylaneRpcProxyModule {
-    type Context = HylaneRpcProxyCtx;
+impl Module for HyperlaneProverModule {
+    type Context = HyperlaneProverCtx;
 
     async fn build(bus: SharedMessageBus, ctx: Self::Context) -> Result<Self> {
         let eth_chain_state = Arc::new(RwLock::new(EthChainState::new(ctx.initial_eth_state_root)));
@@ -100,7 +98,7 @@ impl Module for HylaneRpcProxyModule {
         // (matches `init.rs::derive_program_pubkey` and `reth.rs::derive_program_pubkey`).
         let hyperlane_program_id = derive_program_pubkey(&ctx.bridge_cn);
 
-        Ok(HylaneRpcProxyModule {
+        Ok(HyperlaneProverModule {
             port: ctx.port,
             bus: RpcProxyBusClient::new_from_bus(bus.new_handle()).await,
             node_client,
@@ -118,7 +116,7 @@ impl Module for HylaneRpcProxyModule {
     }
 }
 
-impl HylaneRpcProxyModule {
+impl HyperlaneProverModule {
     async fn serve(&mut self) -> Result<()> {
         info!(
             "📡  Starting Hyperlane JSON-RPC proxy on port {}",

@@ -12,14 +12,14 @@ use hyli_modules::{
     },
 };
 use hyperlane_bridge::client::tx_executor_handler::TxExecutorHandler as BridgeTxHandler;
-use rpc_proxy::{HylaneRpcProxyCtx, HylaneRpcProxyModule};
+use proxy::{HyperlaneProverCtx, HyperlaneProverModule};
 use sdk::{api::NodeInfo, ContractName, Identity};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tracing::info;
 
 mod conf;
 mod init;
-mod rpc_proxy;
+mod proxy;
 
 #[tokio::main]
 async fn main() {
@@ -87,7 +87,7 @@ async fn actual_main() -> Result<()> {
         .to_vec();
 
     handler
-        .build_module::<HylaneRpcProxyModule>(HylaneRpcProxyCtx {
+        .build_module::<HyperlaneProverModule>(HyperlaneProverCtx {
             api: api_ctx.clone(),
             port: server_port,
             node_url: conf.node_url.clone(),
