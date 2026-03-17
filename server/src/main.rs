@@ -12,14 +12,13 @@ use hyli_modules::{
     },
 };
 use hyperlane_bridge::client::tx_executor_handler::TxExecutorHandler as BridgeTxHandler;
-use proxy::{HyperlaneProverCtx, HyperlaneProverModule};
 use sdk::{api::NodeInfo, ContractName, Identity};
+use server::{
+    conf, init,
+    reth_module::{HyperlaneProverCtx, HyperlaneProverModule},
+};
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tracing::info;
-
-mod conf;
-mod init;
-mod proxy;
 
 #[tokio::main]
 async fn main() {
