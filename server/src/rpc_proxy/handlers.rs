@@ -6,12 +6,11 @@ use anyhow::Result;
 use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
 use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
+use crate::rpc_proxy::eth_chain_state::EthChainState;
 use crate::rpc_proxy::types::JsonRpcResponse;
-use hyperlane_bridge::{
-    client::TxExecutorHandler, transferRemoteCall, HyperlaneBridgeState, BRIDGE_CONTRACT_NAME,
-};
+use hyperlane_bridge::{transferRemoteCall, HyperlaneBridgeAction};
 
 #[derive(Clone)]
 pub struct RouterCtx {
@@ -21,6 +20,8 @@ pub struct RouterCtx {
     pub relayer_identity: Identity,
     pub node_client: Arc<NodeApiHttpClient>,
     pub indexer_client: Arc<IndexerApiHttpClient>,
+    /// Shared EVM chain state, updated by the module's ContractListener event handler.
+    pub eth_chain_state: Arc<RwLock<EthChainState>>,
 }
 
 impl RouterCtx {
@@ -30,6 +31,7 @@ impl RouterCtx {
         bridge_cn: ContractName,
         hyperlane_cn: ContractName,
         relayer_identity: Identity,
+        eth_chain_state: Arc<RwLock<EthChainState>>,
     ) -> Result<Self> {
         let node_client = Arc::new(NodeApiHttpClient::new(node_url.clone())?);
         let indexer_client = Arc::new(IndexerApiHttpClient::new(node_url.clone())?);
@@ -40,6 +42,7 @@ impl RouterCtx {
             relayer_identity,
             node_client,
             indexer_client,
+            eth_chain_state,
         })
     }
 }
@@ -92,6 +95,14 @@ pub async fn eth_get_block_by_number(
             let number = format!("0x{:x}", b.height);
             let timestamp = format!("0x{:x}", b.timestamp);
             let hash = format!("0x{}", b.hash);
+            // Read the current EVM state root from the shared EthChainState.
+            let state_root_hex = ctx
+                .eth_chain_state
+                .read()
+                .map(|s| format!("0x{}", hex::encode(s.state_root)))
+                .unwrap_or_else(|_| {
+                    "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
+                });
             JsonRpcResponse::ok(
                 id,
                 json!({
@@ -112,7 +123,7 @@ pub async fn eth_get_block_by_number(
                     "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
                     "uncles": [],
                     "size": "0x1",
-                    "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                    "stateRoot": state_root_hex,
                     "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
                     "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
                 }),
@@ -192,7 +203,7 @@ pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
 
         // Sender: bridge contract name as 32-byte right-padded string.
         let mut sender_bytes = [0u8; 32];
-        let bridge_name = BRIDGE_CONTRACT_NAME.as_bytes();
+        let bridge_name = ctx.bridge_cn.0.as_bytes();
         let copy_len = bridge_name.len().min(32);
         sender_bytes[32 - copy_len..].copy_from_slice(&bridge_name[..copy_len]);
 
@@ -274,7 +285,7 @@ fn parse_transfer_remote_from_reth_blob(data: &[u8]) -> Option<([u8; 32], u128, 
 }
 
 /// Decode a reth blob's raw bytes (stripping any StructuredBlobData wrapper) into a TxEnvelope.
-fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
+pub fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
     let raw_bytes = if let Ok(structured) =
         sdk::StructuredBlobData::<Vec<u8>>::try_from(sdk::BlobData(data.to_vec()))
     {
@@ -377,30 +388,22 @@ pub async fn eth_send_raw_transaction(
     // Build the Hyli blob transaction:
     //   blob[0]: hyperlane reth blob  ← raw EIP-2718 bytes (proven by reth verifier)
     //   blob[1]: hyperlane-bridge blob ← VerifyTransaction (proven by RISC0)
-    let handler = TxExecutorHandler {
-        state: HyperlaneBridgeState {
-            hyperlane_contract: ctx.hyperlane_cn.clone(),
+    let blobs = vec![
+        Blob {
+            contract_name: ctx.hyperlane_cn.clone(),
+            data: BlobData(raw_bytes),
         },
-    };
+        Blob {
+            contract_name: ctx.bridge_cn.clone(),
+            data: BlobData::from(sdk::StructuredBlobData {
+                caller: None,
+                callees: None,
+                parameters: HyperlaneBridgeAction::VerifyTransaction,
+            }),
+        },
+    ];
 
-    let mut builder =
-        client_sdk::transaction_builder::ProvableBlobTx::new(ctx.relayer_identity.clone());
-
-    // Blob 0: reth blob (raw EIP-2718 bytes).
-    builder.blobs.push(Blob {
-        contract_name: ctx.hyperlane_cn.clone(),
-        data: BlobData(raw_bytes.clone()),
-    });
-
-    // Blob 1: bridge VerifyTransaction.
-    if let Err(e) = handler.verify_transaction(&mut builder) {
-        return JsonRpcResponse::internal_error(
-            id,
-            format!("Failed to build verify_transaction blob: {e}"),
-        );
-    }
-
-    let blob_tx = BlobTransaction::new(builder.identity, builder.blobs);
+    let blob_tx = BlobTransaction::new(ctx.relayer_identity.clone(), blobs);
     let tx_hash = match ctx.node_client.send_tx_blob(blob_tx).await {
         Ok(h) => h,
         Err(e) => return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}")),

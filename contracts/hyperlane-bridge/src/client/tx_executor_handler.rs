@@ -1,8 +1,6 @@
 use anyhow::{Context, Result};
 use borsh::{BorshDeserialize, BorshSerialize};
-use client_sdk::transaction_builder::{
-    ProvableBlobTx, TxExecutorHandler as TxExecutorHandlerTrait,
-};
+use client_sdk::transaction_builder::TxExecutorHandler as TxExecutorHandlerTrait;
 
 pub mod metadata {
     pub const HYPERLANE_BRIDGE_ELF: &[u8] = include_bytes!("../../hyperlane-bridge.img");
@@ -11,7 +9,7 @@ pub mod metadata {
 }
 use sdk::{utils::as_hyli_output, Calldata, ContractName, StateCommitment, ZkContract};
 
-use crate::{HyperlaneBridgeAction, HyperlaneBridgeState, BRIDGE_CONTRACT_NAME};
+use crate::HyperlaneBridgeState;
 
 /// Client-side state handler for the hyperlane-bridge policy contract.
 #[derive(Debug, Clone, BorshSerialize, BorshDeserialize)]
@@ -53,23 +51,5 @@ impl TxExecutorHandlerTrait for TxExecutorHandler {
 
     fn get_state_commitment(&self) -> StateCommitment {
         self.state.commit()
-    }
-}
-
-impl TxExecutorHandler {
-    /// Add a `VerifyTransaction` blob to the builder.
-    ///
-    /// This must be called after the reth blob for the `hyperlane` contract has
-    /// already been pushed to `builder.blobs`, since the RISC0 proof will scan
-    /// that blob to run policy checks.
-    pub fn verify_transaction(&self, builder: &mut ProvableBlobTx) -> Result<()> {
-        builder.add_action(
-            ContractName(BRIDGE_CONTRACT_NAME.to_string()),
-            HyperlaneBridgeAction::VerifyTransaction,
-            None,
-            None,
-            None,
-        )?;
-        Ok(())
     }
 }

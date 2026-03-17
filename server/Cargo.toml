@@ -22,7 +22,9 @@ tokio-util = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
+borsh = { workspace = true }
 hex = { workspace = true }
+indexmap = "2"
 k256 = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }

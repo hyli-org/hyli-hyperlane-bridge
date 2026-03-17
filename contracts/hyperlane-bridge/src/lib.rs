@@ -76,9 +76,6 @@ sol! {
     function process(bytes metadata, bytes message) external payable;
 }
 
-/// Name this contract is expected to be registered under.
-pub const BRIDGE_CONTRACT_NAME: &str = "hyperlane-bridge";
-
 // ---------------------------------------------------------------------------
 // ZkContract implementation
 // ---------------------------------------------------------------------------
@@ -168,6 +165,9 @@ mod tests {
     use alloy_signer::SignerSync;
     use alloy_signer_local::PrivateKeySigner;
     use sdk::{BlobIndex, Calldata, ContractName, Identity, IndexedBlobs, TxHash};
+
+    /// Name this contract is expected to be registered under.
+    pub const BRIDGE_CONTRACT_NAME: &str = "hyperlane-bridge";
 
     fn make_state() -> HyperlaneBridgeState {
         HyperlaneBridgeState::default()

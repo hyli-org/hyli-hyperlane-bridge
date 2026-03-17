@@ -68,6 +68,24 @@ async fn actual_main() -> Result<()> {
         openapi: Default::default(),
     });
 
+    let eth_state_root_bytes: [u8; 32] = {
+        let hex_str = conf.eth_state_root.trim_start_matches("0x");
+        let decoded = hex::decode(hex_str).context("Decoding eth_state_root hex")?;
+        decoded
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("eth_state_root must be exactly 32 bytes"))?
+    };
+
+    // Default to an empty chain-spec JSON. Override via `evm_config_json` in the
+    // config file when a real reth executor is wired up
+    // (see `eth_chain_state::build_stateless_input` TODO).
+    let evm_config_json = conf
+        .evm_config_json
+        .as_deref()
+        .unwrap_or("{}")
+        .as_bytes()
+        .to_vec();
+
     handler
         .build_module::<HylaneRpcProxyModule>(HylaneRpcProxyCtx {
             api: api_ctx.clone(),
@@ -77,10 +95,17 @@ async fn actual_main() -> Result<()> {
             bridge_cn: ContractName(conf.bridge_cn.clone()),
             hyperlane_cn: ContractName(conf.hyperlane_cn.clone()),
             relayer_identity,
+            initial_eth_state_root: eth_state_root_bytes,
+            evm_config_json,
         })
         .await?;
 
-    let listened_contracts = HashSet::from([conf.bridge_cn.clone().into()]);
+    // Listen to both the RISC0 bridge contract (for AutoProver) and the reth hyperlane
+    // contract (for HylaneRpcProxyModule to track EVM state and submit reth proofs).
+    let listened_contracts = HashSet::from([
+        conf.bridge_cn.clone().into(),
+        conf.hyperlane_cn.clone().into(),
+    ]);
 
     handler
         .build_module::<ContractListener>(ContractListenerConf {

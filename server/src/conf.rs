@@ -39,6 +39,11 @@ pub struct Conf {
     /// Skip contract deployment on startup
     pub noinit: bool,
 
+    /// EVM chain-spec JSON used when building reth proof payloads.
+    /// Must match the genesis / chain configuration of the Hyli-hosted EVM.
+    /// Leave as `None` (or omit from config) until a reth executor is wired up.
+    pub evm_config_json: Option<String>,
+
     // ── ContractListener / AutoProver ─────────────────────────────────────────
     /// PostgreSQL connection URL for the ContractListener (e.g. postgres://user:pass@host/db)
     pub indexer_database_url: String,
