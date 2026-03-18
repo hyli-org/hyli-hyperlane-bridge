@@ -339,8 +339,7 @@ async fn rpc_handler(
         "eth_getTransactionReceipt" => {
             handlers::eth_get_transaction_receipt(&ctx, id, params).await
         }
-        // Return a generous gas estimate (5 M gas) to cover any contract deployment.
-        "eth_estimateGas" => JsonRpcResponse::ok(id, serde_json::json!("0x4C4B40")),
+        "eth_estimateGas" => handlers::eth_estimate_gas(&ctx, id, params),
         "eth_getTransactionCount" => handlers::eth_get_transaction_count(&ctx, id, params),
         "eth_gasPrice" => handlers::eth_gas_price(&ctx, id),
         "eth_getBalance" => handlers::eth_get_balance(&ctx, id, params),

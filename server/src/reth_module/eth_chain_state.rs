@@ -382,6 +382,74 @@ impl EthChainState {
         self.header_history.back().cloned()
     }
 
+    /// Estimate the gas needed to execute a call/deployment against the current state.
+    ///
+    /// Runs the transaction through revm with a gas limit equal to the block gas limit,
+    /// then returns the actual gas used plus a 30 % buffer, capped at 90 % of the block
+    /// gas limit so that Hyperlane's own 1.1× multiplier never exceeds the block limit.
+    pub fn estimate_gas(
+        &self,
+        from: Address,
+        to: Option<Address>,
+        data: Bytes,
+        value: U256,
+    ) -> u64 {
+        use revm::context::{BlockEnv, TxEnv};
+        use revm::primitives::TxKind;
+        use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+
+        let parent = self.header_history.back();
+        let block_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
+        let basefee = self.gas_price() as u64;
+        let block_number = self.block_number + 1;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let block_env = BlockEnv {
+            number: U256::from(block_number),
+            beneficiary: Address::ZERO,
+            timestamp: U256::from(timestamp),
+            gas_limit: block_gas_limit,
+            basefee,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            blob_excess_gas_and_price: None,
+        };
+
+        let tx_env = TxEnv {
+            tx_type: 2,
+            caller: from,
+            gas_limit: block_gas_limit,
+            gas_price: basefee as u128,
+            kind: to.map(TxKind::Call).unwrap_or(TxKind::Create),
+            value,
+            data,
+            nonce: self.account_nonce(&from),
+            chain_id: Some(self.chain_id()),
+            ..Default::default()
+        };
+
+        let mut db = self.build_cache_db();
+        let ctx = Context::mainnet().with_db(&mut db).with_block(block_env);
+        let mut evm = ctx.build_mainnet();
+
+        match evm.transact(tx_env) {
+            Ok(outcome) => {
+                let gas_used = outcome.result.gas_used();
+                // +30 % buffer, capped at 90 % of block gas limit so Hyperlane's 1.1× stays under block limit.
+                let with_buffer =
+                    (gas_used as u128 * 13 / 10).min(block_gas_limit as u128 * 9 / 10) as u64;
+                with_buffer.max(21_000)
+            }
+            Err(e) => {
+                warn!("estimate_gas execution failed: {e:?}, falling back to 90% of block gas limit");
+                block_gas_limit * 9 / 10
+            }
+        }
+    }
+
     /// Record a settled receipt keyed by `keccak256(raw_eip2718)`.
     ///
     /// Call this after updating `block_number` and `header_history` so that the

@@ -154,6 +154,56 @@ pub fn eth_get_code(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
     JsonRpcResponse::ok(id, json!(code_hex))
 }
 
+pub fn eth_estimate_gas(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let call = params.get(0).cloned().unwrap_or(json!({}));
+
+    let from = call
+        .get("from")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            hex::decode(s.trim_start_matches("0x"))
+                .ok()
+                .filter(|b| b.len() == 20)
+                .map(|b| alloy_primitives::Address::from_slice(&b))
+        })
+        .unwrap_or(alloy_primitives::Address::ZERO);
+
+    let to = call
+        .get("to")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty() && *s != "null" && *s != "0x")
+        .and_then(|s| {
+            hex::decode(s.trim_start_matches("0x"))
+                .ok()
+                .filter(|b| b.len() == 20)
+                .map(|b| alloy_primitives::Address::from_slice(&b))
+        });
+
+    let data = call
+        .get("data")
+        .or_else(|| call.get("input"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+        .map(alloy_primitives::Bytes::from)
+        .unwrap_or_default();
+
+    let value = call
+        .get("value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| u128::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .map(alloy_primitives::U256::from)
+        .unwrap_or_default();
+
+    let gas = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.estimate_gas(from, to, data, value))
+        .unwrap_or(5_000_000);
+
+    info!(gas, "eth_estimateGas");
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", gas)))
+}
+
 pub fn eth_get_storage_at(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
     let slot_hex = params
