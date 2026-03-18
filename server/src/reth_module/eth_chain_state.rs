@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use client_sdk::rest_client::NodeApiClient;
 use indexmap::IndexMap;
 use reth_chainspec::{ChainSpec, EthereumHardforks};
-use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
+use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignerRecoverable};
@@ -149,7 +149,7 @@ impl EthChainState {
             .ok_or_else(|| anyhow::anyhow!("No parent header"))?
             .clone();
 
-        // Execute with placeholder gas_used=0 first to get actual gas consumed.
+        // Execute with placeholder gas_used=0/receipts_root first to get actual values.
         let block_placeholder = build_synthetic_block_inner(
             tx.clone(),
             signer,
@@ -158,6 +158,7 @@ impl EthChainState {
             &self.chain_spec,
             new_root,
             0,
+            EMPTY_ROOT_HASH,
         )?;
 
         let mut db = self.build_cache_db();
@@ -167,7 +168,9 @@ impl EthChainState {
             .execute(&block_placeholder)
             .context("EVM execution failed in apply_transaction")?;
 
-        // Rebuild the block with the real gas_used so the stored header is valid.
+        let receipts_root = Receipt::calculate_receipt_root_no_memo(&output.receipts);
+
+        // Rebuild the block with real gas_used + receipts_root so the stored header is valid.
         let block = build_synthetic_block_inner(
             tx,
             signer,
@@ -176,6 +179,7 @@ impl EthChainState {
             &self.chain_spec,
             new_root,
             output.gas_used,
+            receipts_root,
         )?;
 
         self.merge_bundle(&output.state);
@@ -251,7 +255,7 @@ impl EthChainState {
         let mut db = self.build_cache_db();
         let evm_config = EthEvmConfig::new(self.chain_spec.clone());
 
-        // First pass with placeholder state_root/gas_used to get the execution output.
+        // First pass with placeholder state_root/gas_used/receipts_root to get execution output.
         let block_placeholder = build_synthetic_block_inner(
             tx.clone(),
             signer,
@@ -260,6 +264,7 @@ impl EthChainState {
             &self.chain_spec,
             B256::ZERO,
             0,
+            EMPTY_ROOT_HASH,
         )?;
 
         let mut witness_record = ExecutionWitnessRecord::default();
@@ -304,7 +309,9 @@ impl EthChainState {
 
         let post_state_root = compute_post_state_root(&self.accounts, &output.state);
 
-        // ── Step 4: Build final block with correct post-state root + gas_used ───
+        // ── Step 4: Build final block with correct post-state root + gas_used + receipts_root ─
+
+        let receipts_root = Receipt::calculate_receipt_root_no_memo(&output.receipts);
 
         let final_block = build_synthetic_block_inner(
             tx,
@@ -314,6 +321,7 @@ impl EthChainState {
             &self.chain_spec,
             post_state_root,
             output.gas_used,
+            receipts_root,
         )?;
 
         // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
@@ -738,6 +746,7 @@ fn build_synthetic_block_inner(
     chain_spec: &ChainSpec,
     state_root: B256,
     gas_used: u64,
+    receipts_root: B256,
 ) -> Result<RecoveredBlock<Block>> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -787,7 +796,7 @@ fn build_synthetic_block_inner(
         beneficiary: Address::ZERO,
         state_root,
         transactions_root,
-        receipts_root: EMPTY_ROOT_HASH,
+        receipts_root,
         withdrawals_root,
         logs_bloom: Default::default(),
         difficulty: U256::ZERO,
