@@ -327,6 +327,41 @@ impl EthChainState {
             .context("bincode serialization of StatelessInput failed")
     }
 
+    // ── EVM state accessors ───────────────────────────────────────────────────
+
+    pub fn chain_id(&self) -> u64 {
+        self.chain_config.chain_id
+    }
+
+    /// Current base fee (wei), taken from the most recent block header.
+    pub fn gas_price(&self) -> u64 {
+        self.header_history
+            .back()
+            .and_then(|h| h.base_fee_per_gas())
+            .unwrap_or(1)
+    }
+
+    pub fn account_balance(&self, addr: &Address) -> U256 {
+        self.accounts.get(addr).map(|a| a.balance).unwrap_or_default()
+    }
+
+    pub fn account_nonce(&self, addr: &Address) -> u64 {
+        self.accounts.get(addr).map(|a| a.nonce).unwrap_or(0)
+    }
+
+    /// Returns a clone of the sealed header for EVM block `number`, if within history.
+    pub fn get_header_by_number(&self, number: u64) -> Option<SealedHeader> {
+        self.header_history
+            .iter()
+            .find(|h| h.number() == number)
+            .cloned()
+    }
+
+    /// Returns a clone of the most recent sealed header.
+    pub fn latest_header(&self) -> Option<SealedHeader> {
+        self.header_history.back().cloned()
+    }
+
     fn build_cache_db(&self) -> CacheDB<EmptyDB> {
         let mut db = CacheDB::new(EmptyDB::default());
 

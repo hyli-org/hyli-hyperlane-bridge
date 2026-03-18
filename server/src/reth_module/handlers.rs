@@ -1,6 +1,7 @@
+use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::keccak256;
+use alloy_primitives::{keccak256, Address};
 use alloy_sol_types::SolCall;
 use anyhow::Result;
 use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
@@ -54,83 +55,109 @@ fn dispatch_topic0() -> [u8; 32] {
 
 // ── Block helpers ─────────────────────────────────────────────────────────────
 
-pub async fn eth_block_number(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
-    match ctx.indexer_client.get_last_block().await {
-        Ok(block) => JsonRpcResponse::ok(id, json!(format!("0x{:x}", block.height))),
-        Err(e) => JsonRpcResponse::internal_error(id, format!("Failed to get last block: {e}")),
-    }
+pub fn eth_block_number(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    let block_number = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.block_number)
+        .unwrap_or(0);
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", block_number)))
 }
 
-pub async fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::ok(id, json!(format!("0x{:x}", ctx.hyli_chain_id)))
+pub fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    let chain_id = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.chain_id())
+        .unwrap_or(0);
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", chain_id)))
 }
 
-pub async fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
-    JsonRpcResponse::ok(id, json!(ctx.hyli_chain_id.to_string()))
+pub fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    let chain_id = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.chain_id())
+        .unwrap_or(0);
+    JsonRpcResponse::ok(id, json!(chain_id.to_string()))
 }
 
-pub async fn eth_get_block_by_number(
-    ctx: &RouterCtx,
-    id: Value,
-    params: &Value,
-) -> JsonRpcResponse {
+pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let block_tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("latest");
 
-    let block = if block_tag == "latest" {
-        ctx.indexer_client.get_last_block().await
-    } else {
-        let height_str = block_tag.trim_start_matches("0x");
-        match u64::from_str_radix(height_str, 16) {
-            Ok(h) => {
-                ctx.indexer_client
-                    .get_block_by_height(&sdk::BlockHeight(h))
-                    .await
+    let header = ctx.eth_chain_state.read().ok().and_then(|state| {
+        match block_tag {
+            "latest" | "pending" => state.latest_header(),
+            "earliest" => state.get_header_by_number(0),
+            tag => {
+                let n_str = tag.trim_start_matches("0x");
+                u64::from_str_radix(n_str, 16)
+                    .ok()
+                    .and_then(|n| state.get_header_by_number(n))
             }
-            Err(_) => return JsonRpcResponse::internal_error(id, "Invalid block number"),
         }
-    };
+    });
 
-    match block {
-        Ok(b) => {
-            let number = format!("0x{:x}", b.height);
-            let timestamp = format!("0x{:x}", b.timestamp);
-            let hash = format!("0x{}", b.hash);
-            // Read the current EVM state root from the shared EthChainState.
-            let state_root_hex = ctx
-                .eth_chain_state
-                .read()
-                .map(|s| format!("0x{}", hex::encode(s.state_root)))
-                .unwrap_or_else(|_| {
-                    "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
-                });
-            JsonRpcResponse::ok(
-                id,
-                json!({
-                    "number": number,
-                    "hash": hash,
-                    "parentHash": format!("0x{}", b.parent_hash),
-                    "timestamp": timestamp,
-                    "transactions": [],
-                    "gasLimit": "0x1c9c380",
-                    "gasUsed": "0x0",
-                    "baseFeePerGas": "0x1",
-                    "extraData": "0x",
-                    "logsBloom": "0x".to_string() + &"0".repeat(512),
-                    "miner": "0x0000000000000000000000000000000000000000",
-                    "difficulty": "0x0",
-                    "totalDifficulty": "0x0",
-                    "nonce": "0x0000000000000000",
-                    "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
-                    "uncles": [],
-                    "size": "0x1",
-                    "stateRoot": state_root_hex,
-                    "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                    "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                }),
-            )
-        }
-        Err(e) => JsonRpcResponse::internal_error(id, format!("Failed to get block: {e}")),
+    match header {
+        Some(h) => JsonRpcResponse::ok(id, block_json_from_header(&h)),
+        None => JsonRpcResponse::ok(id, Value::Null),
     }
+}
+
+fn block_json_from_header(h: &reth_primitives_traits::SealedHeader) -> Value {
+    json!({
+        "number": format!("0x{:x}", h.number()),
+        "hash": format!("0x{}", hex::encode(h.hash())),
+        "parentHash": format!("0x{}", hex::encode(h.parent_hash())),
+        "stateRoot": format!("0x{}", hex::encode(h.state_root())),
+        "timestamp": format!("0x{:x}", h.timestamp()),
+        "gasLimit": format!("0x{:x}", h.gas_limit()),
+        "gasUsed": format!("0x{:x}", h.gas_used()),
+        "baseFeePerGas": h.base_fee_per_gas()
+            .map(|f| format!("0x{:x}", f))
+            .unwrap_or_else(|| "0x0".to_string()),
+        "transactions": [],
+        "logsBloom": "0x".to_string() + &"0".repeat(512),
+        "miner": "0x0000000000000000000000000000000000000000",
+        "difficulty": "0x0",
+        "totalDifficulty": "0x0",
+        "nonce": "0x0000000000000000",
+        "sha3Uncles": "0x1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347",
+        "uncles": [],
+        "size": "0x1",
+        "receiptsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "transactionsRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "extraData": "0x",
+    })
+}
+
+pub fn eth_get_balance(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let addr = parse_address_param(params, 0);
+    let balance = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.account_balance(&addr))
+        .unwrap_or_default();
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", balance)))
+}
+
+pub fn eth_get_transaction_count(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let addr = parse_address_param(params, 0);
+    let nonce = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.account_nonce(&addr))
+        .unwrap_or(0);
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", nonce)))
+}
+
+pub fn eth_gas_price(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    let gas_price = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.gas_price())
+        .unwrap_or(1);
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", gas_price)))
 }
 
 // ── eth_getLogs ───────────────────────────────────────────────────────────────
@@ -323,7 +350,7 @@ fn build_hyperlane_message(
 
 // ── eth_call ──────────────────────────────────────────────────────────────────
 
-pub async fn eth_call(_ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+pub fn eth_call(_ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let data = params
         .get(0)
         .and_then(|obj| obj.get("data"))
@@ -487,4 +514,18 @@ fn extract_tx_input(tx: &TxEnvelope) -> &[u8] {
         TxEnvelope::Eip7702(t) => t.tx().input.as_ref(),
         _ => &[],
     }
+}
+
+/// Parse an Ethereum address from `params[index]`, returning `Address::ZERO` on failure.
+fn parse_address_param(params: &Value, index: usize) -> Address {
+    params
+        .get(index)
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            hex::decode(s.trim_start_matches("0x"))
+                .ok()
+                .filter(|b| b.len() == 20)
+                .map(|b| Address::from_slice(&b))
+        })
+        .unwrap_or(Address::ZERO)
 }

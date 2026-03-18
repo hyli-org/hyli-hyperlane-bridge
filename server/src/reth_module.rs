@@ -296,24 +296,21 @@ async fn rpc_handler(
     let params = &req.params;
 
     let resp = match req.method.as_str() {
-        "eth_blockNumber" => handlers::eth_block_number(&ctx, id).await,
-        "eth_chainId" => handlers::eth_chain_id(&ctx, id).await,
-        "net_version" => handlers::net_version(&ctx, id).await,
-        "eth_getBlockByNumber" => handlers::eth_get_block_by_number(&ctx, id, params).await,
+        "eth_blockNumber" => handlers::eth_block_number(&ctx, id),
+        "eth_chainId" => handlers::eth_chain_id(&ctx, id),
+        "net_version" => handlers::net_version(&ctx, id),
+        "eth_getBlockByNumber" => handlers::eth_get_block_by_number(&ctx, id, params),
         "eth_getLogs" => handlers::eth_get_logs(&ctx, id, params).await,
-        "eth_call" => handlers::eth_call(&ctx, id, params).await,
+        "eth_call" => handlers::eth_call(&ctx, id, params),
         "eth_sendTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
         "eth_sendRawTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
         "eth_getTransactionReceipt" => {
             handlers::eth_get_transaction_receipt(&ctx, id, params).await
         }
         "eth_estimateGas" => JsonRpcResponse::ok(id, serde_json::json!("0x186a0")),
-        "eth_getTransactionCount" => JsonRpcResponse::ok(id, serde_json::json!("0x0")),
-        "eth_gasPrice" => JsonRpcResponse::ok(id, serde_json::json!("0x1")),
-        "eth_getBalance" => JsonRpcResponse::ok(
-            id,
-            serde_json::json!("0xde0b6b3a7640000"), // 1 ETH
-        ),
+        "eth_getTransactionCount" => handlers::eth_get_transaction_count(&ctx, id, params),
+        "eth_gasPrice" => handlers::eth_gas_price(&ctx, id),
+        "eth_getBalance" => handlers::eth_get_balance(&ctx, id, params),
         other => JsonRpcResponse::method_not_found(id, other),
     };
 
