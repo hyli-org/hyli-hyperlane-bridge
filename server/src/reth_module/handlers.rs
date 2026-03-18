@@ -543,6 +543,48 @@ pub async fn eth_send_raw_transaction(
     JsonRpcResponse::ok(id, json!(format!("0x{}", hex::encode(*evm_tx_hash))))
 }
 
+// ── eth_getTransactionByHash ──────────────────────────────────────────────────
+
+pub fn eth_get_transaction_by_hash(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let hash_hex = match params.get(0).and_then(|v| v.as_str()) {
+        Some(h) => h.trim_start_matches("0x"),
+        None => return JsonRpcResponse::ok(id, Value::Null),
+    };
+
+    let evm_hash_bytes: Option<[u8; 32]> =
+        hex::decode(hash_hex).ok().and_then(|b| b.try_into().ok());
+
+    if let Some(hash_bytes) = evm_hash_bytes {
+        let receipt = ctx
+            .eth_chain_state
+            .read()
+            .map(|s| s.settled_receipts.get(&hash_bytes).cloned())
+            .unwrap_or(None);
+
+        if let Some(r) = receipt {
+            return JsonRpcResponse::ok(
+                id,
+                json!({
+                    "hash": format!("0x{hash_hex}"),
+                    "blockHash": format!("0x{}", hex::encode(r.block_hash)),
+                    "blockNumber": format!("0x{:x}", r.block_number),
+                    "transactionIndex": "0x0",
+                    "from": "0x0000000000000000000000000000000000000000",
+                    "to": null,
+                    "value": "0x0",
+                    "gas": "0x0",
+                    "gasPrice": "0x0",
+                    "input": "0x",
+                    "nonce": "0x0",
+                    "type": "0x2",
+                }),
+            );
+        }
+    }
+
+    JsonRpcResponse::ok(id, Value::Null)
+}
+
 // ── eth_getTransactionReceipt ─────────────────────────────────────────────────
 
 pub async fn eth_get_transaction_receipt(

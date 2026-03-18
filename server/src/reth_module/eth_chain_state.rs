@@ -45,7 +45,7 @@ pub struct EthTxReceipt {
 pub struct AccountState {
     pub balance: U256,
     pub nonce: u64,
-    /// Raw bytecode (empty for EOAs).
+    /// Raw bytecode (empty for EOAs)
     pub code: Bytes,
     /// `keccak256(code)`, or `KECCAK_EMPTY` for EOAs.
     pub code_hash: B256,
@@ -178,6 +178,51 @@ impl EthChainState {
         self.merge_bundle(&output.state);
 
         self.state_root = new_root;
+        self.block_number += 1;
+
+        let new_header = SealedHeader::seal_slow(final_block.header().clone());
+        self.header_history.push_back(new_header);
+        if self.header_history.len() > 256 {
+            self.header_history.pop_front();
+        }
+
+        Ok(())
+    }
+
+    /// Apply a transaction speculatively, computing the post-state root locally.
+    ///
+    /// Unlike [`apply_transaction`], no canonical root is needed — the root is derived
+    /// from the EVM state diff.  Call this at sequencing time so subsequent proofs are
+    /// built against the correct pre-state.  On settlement success the canonical root
+    /// from Hyli is used to confirm (or correct) `state_root`.
+    pub fn apply_transaction_speculative(&mut self, raw_eip2718: &[u8]) -> Result<()> {
+        let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
+            .context("Failed to decode EIP-2718 transaction")?;
+        let signer = tx
+            .recover_signer()
+            .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+        let parent = self
+            .header_history
+            .back()
+            .ok_or_else(|| anyhow::anyhow!("No parent header"))?
+            .clone();
+
+        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+        let exec_block =
+            build_exec_block(tx, signer, &parent, self.block_number + 1, &self.chain_spec)?;
+
+        let mut db = self.build_cache_db();
+        let output = evm_config
+            .executor(&mut db)
+            .execute(&exec_block)
+            .context("EVM execution failed in apply_transaction_speculative")?;
+
+        let post_root = compute_post_state_root(&self.accounts, &output.state);
+        let final_block = finalize_block(exec_block, &output.receipts, output.gas_used, post_root);
+
+        self.merge_bundle(&output.state);
+        self.state_root = post_root;
         self.block_number += 1;
 
         let new_header = SealedHeader::seal_slow(final_block.header().clone());
@@ -957,4 +1002,168 @@ fn write_segment(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len() as u32;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(data);
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use alloy_consensus::{SignableTransaction, TxEip1559};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_network::TxSignerSync;
+    use alloy_primitives::{TxKind, U256};
+    use alloy_signer_local::PrivateKeySigner;
+
+    // Hardhat/Anvil account 0 — funded in TEST_GENESIS.
+    pub const SIGNER_KEY: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    // Pre-Merge (London only) genesis — keeps EVM execution simple: no prevrandao,
+    // no withdrawals root, no beacon block root.
+    pub const TEST_GENESIS: &str = r#"{
+        "config": {
+            "chainId": 1337,
+            "homesteadBlock": 0,
+            "eip150Block": 0,
+            "eip155Block": 0,
+            "eip158Block": 0,
+            "byzantiumBlock": 0,
+            "constantinopleBlock": 0,
+            "petersburgBlock": 0,
+            "istanbulBlock": 0,
+            "berlinBlock": 0,
+            "londonBlock": 0
+        },
+        "nonce": "0x0",
+        "timestamp": "0x0",
+        "extraData": "0x",
+        "gasLimit": "0x1c9c380",
+        "difficulty": "0x20000",
+        "baseFeePerGas": "0x3B9ACA00",
+        "alloc": {
+            "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {
+                "balance": "0x10000000000000000000"
+            }
+        }
+    }"#;
+
+    /// Build a minimal signed EIP-1559 ETH-transfer (21 000 gas) from `SIGNER_KEY`.
+    pub fn make_signed_transfer(nonce: u64) -> Vec<u8> {
+        let signer: PrivateKeySigner = SIGNER_KEY.parse().unwrap();
+        let mut tx = TxEip1559 {
+            chain_id: 1337,
+            nonce,
+            gas_limit: 21_000,
+            max_fee_per_gas: 2_000_000_000,
+            max_priority_fee_per_gas: 1_000_000_000,
+            to: TxKind::Call(alloy_primitives::address!(
+                "0000000000000000000000000000000000000001"
+            )),
+            value: U256::from(1u64),
+            ..Default::default()
+        };
+        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
+        let envelope = alloy_consensus::TxEnvelope::Eip1559(tx.into_signed(sig));
+        let mut buf = Vec::new();
+        envelope.encode_2718(&mut buf);
+        buf
+    }
+
+    #[test]
+    fn speculative_apply_advances_block_number() {
+        let mut state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        assert_eq!(state.block_number, 0);
+
+        let raw = make_signed_transfer(0);
+        state.apply_transaction_speculative(&raw).unwrap();
+
+        assert_eq!(state.block_number, 1);
+        assert_eq!(state.header_history.len(), 2); // genesis + block 1
+    }
+
+    #[test]
+    fn speculative_apply_changes_state_root() {
+        let mut state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        let root_before = state.state_root;
+
+        let raw = make_signed_transfer(0);
+        state.apply_transaction_speculative(&raw).unwrap();
+
+        // Balance was transferred so the trie root must change.
+        assert_ne!(state.state_root, root_before);
+    }
+
+    #[test]
+    fn snapshot_clone_restores_state() {
+        let mut state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        let snapshot = state.clone();
+
+        let raw = make_signed_transfer(0);
+        state.apply_transaction_speculative(&raw).unwrap();
+
+        assert_ne!(state.block_number, snapshot.block_number);
+        assert_ne!(state.state_root, snapshot.state_root);
+
+        // Roll back.
+        state = snapshot.clone();
+        assert_eq!(state.block_number, snapshot.block_number);
+        assert_eq!(state.state_root, snapshot.state_root);
+    }
+
+    #[test]
+    fn rollback_removes_receipt_and_header() {
+        let mut state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        let raw_a = make_signed_transfer(0);
+        let raw_b = make_signed_transfer(1);
+
+        // Apply A speculatively, snapshot, then apply B.
+        state.apply_transaction_speculative(&raw_a).unwrap();
+        state.record_settled_receipt(&raw_a, true);
+        let snapshot_before_b = state.clone();
+
+        state.apply_transaction_speculative(&raw_b).unwrap();
+        state.record_settled_receipt(&raw_b, true);
+
+        assert_eq!(state.block_number, 2);
+        let hash_b: [u8; 32] = *alloy_primitives::keccak256(&raw_b);
+        assert!(state.settled_receipts.contains_key(&hash_b));
+
+        // Roll back to before B.
+        state = snapshot_before_b;
+
+        assert_eq!(state.block_number, 1);
+        assert!(
+            !state.settled_receipts.contains_key(&hash_b),
+            "B's receipt must be gone after rollback"
+        );
+        let hash_a: [u8; 32] = *alloy_primitives::keccak256(&raw_a);
+        assert!(
+            state.settled_receipts.contains_key(&hash_a),
+            "A's receipt must survive rollback"
+        );
+    }
+
+    #[test]
+    fn sequential_speculative_applies_build_correct_chain() {
+        let mut state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+
+        for nonce in 0..3u64 {
+            let raw = make_signed_transfer(nonce);
+            state.apply_transaction_speculative(&raw).unwrap();
+        }
+
+        assert_eq!(state.block_number, 3);
+        // genesis + 3 blocks
+        assert_eq!(state.header_history.len(), 4);
+        // Each block chains correctly.
+        let headers: Vec<_> = state.header_history.iter().collect();
+        for i in 1..headers.len() {
+            assert_eq!(
+                headers[i].parent_hash(),
+                headers[i - 1].hash(),
+                "block {i} parent_hash must equal block {}'s hash",
+                i - 1
+            );
+        }
+    }
 }

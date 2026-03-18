@@ -8,6 +8,7 @@ client-sdk = { git = "https://github.com/hyli-org/hyli.git", default-features = 
 hyli-smt-token = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-smt-token", branch = "main" }
 smt-token = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-smt-token", branch = "main" }
 hyli-modules = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-modules", branch = "main" }
+hyli-turmoil-shims = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-turmoil-shims", branch = "main" }
 hyli-net = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-net", branch = "main" }
 hyli-model = { git = "https://github.com/hyli-org/hyli.git", package = "hyli-model", branch = "main" }
 

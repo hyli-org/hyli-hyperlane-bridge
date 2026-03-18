@@ -42,3 +42,9 @@ k256 = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
 tower-http = { workspace = true, features = ["cors"] }
+
+[dev-dependencies]
+hyli-turmoil-shims = { workspace = true }
+alloy-network = { version = "1.6.3" }
+alloy-signer = { version = "1.6.3", default-features = false }
+alloy-signer-local = { version = "1.6.3", default-features = false }
