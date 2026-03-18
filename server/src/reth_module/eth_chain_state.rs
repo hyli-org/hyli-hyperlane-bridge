@@ -440,12 +440,13 @@ impl EthChainState {
         value: U256,
     ) -> u64 {
         use revm::context::{BlockEnv, TxEnv};
+        use revm::context_interface::block::BlobExcessGasAndPrice;
         use revm::primitives::TxKind;
         use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
         let parent = self.header_history.back();
         let block_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
-        let basefee = self.gas_price() as u64;
+        let basefee = self.gas_price();
         let block_number = self.block_number + 1;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -460,7 +461,10 @@ impl EthChainState {
             basefee,
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
-            blob_excess_gas_and_price: None,
+            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
+                excess_blob_gas: 0,
+                blob_gasprice: 1,
+            }),
         };
 
         let tx_env = TxEnv {
@@ -489,8 +493,78 @@ impl EthChainState {
                 with_buffer.max(21_000)
             }
             Err(e) => {
-                warn!("estimate_gas execution failed: {e:?}, falling back to 90% of block gas limit");
+                warn!(
+                    "estimate_gas execution failed: {e:?}, falling back to 90% of block gas limit"
+                );
                 block_gas_limit * 9 / 10
+            }
+        }
+    }
+
+    /// Execute a call against the current EVM state and return the output bytes.
+    ///
+    /// Returns `(success, output)` where `output` is the return data (or revert data).
+    pub fn execute_call(
+        &self,
+        from: Address,
+        to: Option<Address>,
+        data: Bytes,
+        value: U256,
+    ) -> (bool, Bytes) {
+        use revm::context::{BlockEnv, TxEnv};
+        use revm::context_interface::block::BlobExcessGasAndPrice;
+        use revm::primitives::TxKind;
+        use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
+
+        let parent = self.header_history.back();
+        let block_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
+        let basefee = self.gas_price();
+        let block_number = self.block_number + 1;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let block_env = BlockEnv {
+            number: U256::from(block_number),
+            beneficiary: Address::ZERO,
+            timestamp: U256::from(timestamp),
+            gas_limit: block_gas_limit,
+            basefee,
+            difficulty: U256::ZERO,
+            prevrandao: Some(B256::ZERO),
+            blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
+                excess_blob_gas: 0,
+                blob_gasprice: 1,
+            }),
+        };
+
+        let tx_env = TxEnv {
+            tx_type: 2,
+            caller: from,
+            gas_limit: block_gas_limit,
+            gas_price: basefee as u128,
+            kind: to.map(TxKind::Call).unwrap_or(TxKind::Create),
+            value,
+            data,
+            nonce: self.account_nonce(&from),
+            chain_id: Some(self.chain_id()),
+            ..Default::default()
+        };
+
+        let mut db = self.build_cache_db();
+        let ctx = Context::mainnet().with_db(&mut db).with_block(block_env);
+        let mut evm = ctx.build_mainnet();
+
+        match evm.transact(tx_env) {
+            Ok(outcome) => {
+                let success = outcome.result.is_success();
+                let output = outcome.result.into_output().unwrap_or_default();
+                (success, output)
+            }
+            Err(e) => {
+                warn!("execute_call EVM execution failed: {e:?}");
+                (false, Bytes::default())
             }
         }
     }

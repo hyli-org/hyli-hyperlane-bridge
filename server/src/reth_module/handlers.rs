@@ -451,37 +451,64 @@ fn build_hyperlane_message(
 
 // ── eth_call ──────────────────────────────────────────────────────────────────
 
-pub fn eth_call(_ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
-    let data = params
-        .get(0)
-        .and_then(|obj| obj.get("data"))
+pub fn eth_call(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    use alloy_primitives::{Bytes, U256};
+
+    let call_obj = match params.get(0) {
+        Some(v) => v,
+        None => return JsonRpcResponse::err(id, -32602, "Missing call object"),
+    };
+
+    let from: alloy_primitives::Address = call_obj
+        .get("from")
         .and_then(|v| v.as_str())
-        .unwrap_or("0x");
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(alloy_primitives::Address::ZERO);
 
-    let data_bytes = hex::decode(data.trim_start_matches("0x")).unwrap_or_default();
+    let to: Option<alloy_primitives::Address> = call_obj
+        .get("to")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse().ok());
 
-    if data_bytes.len() < 4 {
-        return JsonRpcResponse::ok(id, json!("0x"));
+    let data: Bytes = call_obj
+        .get("data")
+        .or_else(|| call_obj.get("input"))
+        .and_then(|v| v.as_str())
+        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+        .map(Bytes::from)
+        .unwrap_or_default();
+
+    let value: U256 = call_obj
+        .get("value")
+        .and_then(|v| v.as_str())
+        .and_then(|s| {
+            let s = s.trim_start_matches("0x");
+            u128::from_str_radix(s, 16).ok()
+        })
+        .map(U256::from)
+        .unwrap_or(U256::ZERO);
+
+    let state = match ctx.eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+
+    let (success, output) = state.execute_call(from, to, data, value);
+    let output_hex = format!("0x{}", hex::encode(&output));
+
+    info!(
+        "eth_call to={} success={} output_len={}",
+        to.map(|a| format!("{a:?}")).unwrap_or_default(),
+        success,
+        output.len()
+    );
+
+    if success {
+        JsonRpcResponse::ok(id, json!(output_hex))
+    } else {
+        // Return execution revert error (code 3) with revert data
+        JsonRpcResponse::err(id, 3, format!("execution reverted: {output_hex}"))
     }
-
-    let selector = &data_bytes[..4];
-
-    // latestCheckpoint() -> (bytes32, uint32) stub
-    let latest_checkpoint_sel = &keccak256("latestCheckpoint()")[..4];
-    if selector == latest_checkpoint_sel {
-        return JsonRpcResponse::ok(id, json!(format!("0x{}", "0".repeat(128))));
-    }
-
-    // threshold() -> uint8
-    let threshold_sel = &keccak256("threshold()")[..4];
-    if selector == threshold_sel {
-        return JsonRpcResponse::ok(
-            id,
-            json!("0x0000000000000000000000000000000000000000000000000000000000000001"),
-        );
-    }
-
-    JsonRpcResponse::ok(id, json!("0x"))
 }
 
 // ── eth_sendRawTransaction ────────────────────────────────────────────────────
