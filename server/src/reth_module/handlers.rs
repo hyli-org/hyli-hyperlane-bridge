@@ -154,6 +154,34 @@ pub fn eth_get_code(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
     JsonRpcResponse::ok(id, json!(code_hex))
 }
 
+pub fn eth_get_storage_at(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let addr = parse_address_param(params, 0);
+    let slot_hex = params
+        .get(1)
+        .and_then(|v| v.as_str())
+        .unwrap_or("0x0")
+        .trim_start_matches("0x");
+    let slot_bytes = hex::decode(slot_hex).unwrap_or_default();
+    let mut slot_arr = [0u8; 32];
+    let copy_start = 32usize.saturating_sub(slot_bytes.len());
+    slot_arr[copy_start..].copy_from_slice(&slot_bytes[slot_bytes.len().saturating_sub(32)..]);
+    let slot = alloy_primitives::U256::from_be_bytes(slot_arr);
+
+    let value = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| {
+            s.accounts
+                .get(&addr)
+                .and_then(|a| a.storage.get(&slot).copied())
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+
+    let value_bytes: [u8; 32] = value.to_be_bytes();
+    JsonRpcResponse::ok(id, json!(format!("0x{}", hex::encode(value_bytes))))
+}
+
 pub fn eth_get_balance(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
     let balance = ctx
