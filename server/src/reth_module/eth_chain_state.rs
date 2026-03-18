@@ -151,14 +151,14 @@ impl EthChainState {
             new_root,
         )?;
 
-        let mut db = build_cache_db(&self.accounts);
+        let mut db = self.build_cache_db();
         let evm_config = EthEvmConfig::new(self.chain_spec.clone());
         let output = evm_config
             .executor(&mut db)
             .execute(&block)
             .context("EVM execution failed in apply_transaction")?;
 
-        merge_bundle_into_accounts(&mut self.accounts, &output.state);
+        self.merge_bundle(&output.state);
 
         self.state_root = new_root;
         self.block_number += 1;
@@ -170,6 +170,219 @@ impl EthChainState {
         }
 
         Ok(())
+    }
+
+    /// Build the reth proof payload for a pending transaction.
+    ///
+    /// Payload format:
+    /// ```text
+    /// [4-byte LE u32: calldata_len]  [borsh(Calldata)]
+    /// [4-byte LE u32: stateless_len] [bincode(StatelessInput)]
+    /// [4-byte LE u32: evm_config_len][JSON chain-spec bytes]
+    /// ```
+    pub fn build_proof_payload(&self, pending: &PendingRethProof) -> Result<Vec<u8>> {
+        use borsh::to_vec as borsh_to_vec;
+        use sdk::Calldata;
+
+        let tx_hash = pending.tx_id.1.clone();
+        let calldata = Calldata {
+            identity: pending.hyli_tx.identity.clone(),
+            tx_hash,
+            private_input: vec![],
+            blobs: pending.hyli_tx.blobs.clone().into(),
+            index: pending.blob_index,
+            tx_ctx: Some((*pending.tx_ctx).clone()),
+            tx_blob_count: pending.hyli_tx.blobs.len(),
+        };
+
+        let calldata_bytes = borsh_to_vec(&calldata)
+            .map_err(|e| anyhow::anyhow!("Failed to borsh-encode calldata: {e}"))?;
+
+        let stateless_bytes = self.build_stateless_input(&pending.raw_eip2718)?;
+
+        let evm_config_json =
+            serde_json::to_vec(&self.chain_config).context("Serializing chain config")?;
+
+        let mut payload = Vec::new();
+        write_segment(&mut payload, &calldata_bytes);
+        write_segment(&mut payload, &stateless_bytes);
+        write_segment(&mut payload, &evm_config_json);
+
+        Ok(payload)
+    }
+
+    /// Build the bincode-encoded `StatelessInput` for a single EIP-2718 transaction.
+    pub fn build_stateless_input(&self, raw_eip2718: &[u8]) -> Result<Vec<u8>> {
+        let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
+            .context("Failed to decode EIP-2718 transaction")?;
+        let signer = tx
+            .recover_signer()
+            .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+        let parent = self
+            .header_history
+            .back()
+            .ok_or_else(|| anyhow::anyhow!("No parent header in history"))?
+            .clone();
+
+        // ── Step 1: Execute to collect witness record + state diff ────────────
+
+        let mut db = self.build_cache_db();
+        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+
+        // First pass with placeholder state_root to get the execution output.
+        let block_placeholder = build_synthetic_block_inner(
+            tx.clone(),
+            signer,
+            &parent,
+            self.block_number + 1,
+            &self.chain_spec,
+            B256::ZERO,
+        )?;
+
+        let mut witness_record = ExecutionWitnessRecord::default();
+        let output = evm_config
+            .executor(&mut db)
+            .execute_with_state_closure(&block_placeholder, |state_db| {
+                witness_record.record_executed_state(state_db);
+            })
+            .context("EVM execution failed in build_stateless_input")?;
+
+        // ── Step 2: Compute pre-state proof nodes ─────────────────────────────
+
+        let hashed_state = &witness_record.hashed_state;
+        let account_proof_targets: Vec<B256> = hashed_state.accounts.keys().cloned().collect();
+
+        let (pre_state_root, mut witness_nodes) =
+            build_account_trie_with_proofs(&self.accounts, &account_proof_targets);
+
+        if pre_state_root != self.state_root {
+            warn!(
+                computed = %pre_state_root,
+                tracked = %self.state_root,
+                "Pre-state trie root mismatch vs tracked state root"
+            );
+        }
+
+        // Add storage proof nodes for accessed storage.
+        for (hashed_addr, hashed_storage) in &hashed_state.storages {
+            let addr = find_address_by_hash(&self.accounts, hashed_addr);
+            let empty_storage: HashMap<U256, U256> = HashMap::new();
+            let storage = addr
+                .and_then(|a| self.accounts.get(&a))
+                .map(|s| &s.storage)
+                .unwrap_or(&empty_storage);
+
+            let storage_targets: Vec<B256> = hashed_storage.storage.keys().cloned().collect();
+            let (_, storage_nodes) = build_storage_trie_with_proofs(storage, &storage_targets);
+            witness_nodes.extend(storage_nodes);
+        }
+
+        // ── Step 3: Compute post-state root ──────────────────────────────────
+
+        let hashed_post = HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(
+            &output.state.state,
+        );
+        let post_state_root = compute_post_state_root(&self.accounts, &hashed_post)?;
+
+        // ── Step 4: Build final block with correct post-state root ────────────
+
+        let final_block = build_synthetic_block_inner(
+            tx,
+            signer,
+            &parent,
+            self.block_number + 1,
+            &self.chain_spec,
+            post_state_root,
+        )?;
+
+        // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
+
+        let headers: Vec<Bytes> = self
+            .header_history
+            .iter()
+            .map(|h| {
+                let mut buf = Vec::new();
+                h.header().encode(&mut buf);
+                Bytes::from(buf)
+            })
+            .collect();
+
+        let witness = ExecutionWitness {
+            state: witness_nodes,
+            codes: witness_record.codes,
+            keys: witness_record.keys,
+            headers,
+        };
+
+        // ── Step 6: Assemble StatelessInput and serialize ─────────────────────
+
+        let stateless_input = StatelessInput {
+            block: final_block.into_block(),
+            witness,
+            chain_config: self.chain_config.clone(),
+        };
+
+        bincode::serialize(&stateless_input)
+            .context("bincode serialization of StatelessInput failed")
+    }
+
+    fn build_cache_db(&self) -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+
+        for (addr, state) in &self.accounts {
+            let bytecode = if state.code.is_empty() {
+                Bytecode::default()
+            } else {
+                Bytecode::new_raw(state.code.clone())
+            };
+
+            let info = AccountInfo {
+                balance: state.balance,
+                nonce: state.nonce,
+                code_hash: state.code_hash,
+                code: Some(bytecode),
+                account_id: None,
+            };
+
+            db.insert_account_info(*addr, info);
+
+            for (slot, value) in &state.storage {
+                db.insert_account_storage(*addr, *slot, *value)
+                    .expect("insert_account_storage should not fail with EmptyDB");
+            }
+        }
+
+        db
+    }
+
+    fn merge_bundle(&mut self, bundle: &BundleState) {
+        for (addr, bundle_account) in bundle.state() {
+            match &bundle_account.info {
+                None => {
+                    self.accounts.remove(addr);
+                }
+                Some(info) => {
+                    let entry = self.accounts.entry(*addr).or_default();
+                    entry.nonce = info.nonce;
+                    entry.balance = info.balance;
+                    entry.code_hash = info.code_hash;
+                    if let Some(code) = &info.code {
+                        let raw: Bytes = code.original_bytes();
+                        entry.code = raw;
+                    }
+                    for (slot, storage_slot) in &bundle_account.storage {
+                        let slot_u256 = U256::from(*slot);
+                        let present: U256 = storage_slot.present_value();
+                        if present.is_zero() {
+                            entry.storage.remove(&slot_u256);
+                        } else {
+                            entry.storage.insert(slot_u256, present);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -226,48 +439,6 @@ pub fn extract_pending_proof(
     })
 }
 
-/// Build the reth proof payload for a pending transaction.
-///
-/// Payload format:
-/// ```text
-/// [4-byte LE u32: calldata_len]  [borsh(Calldata)]
-/// [4-byte LE u32: stateless_len] [bincode(StatelessInput)]
-/// [4-byte LE u32: evm_config_len][JSON chain-spec bytes]
-/// ```
-pub async fn build_reth_proof_payload(
-    pending: &PendingRethProof,
-    eth_state: &EthChainState,
-) -> Result<Vec<u8>> {
-    use borsh::to_vec as borsh_to_vec;
-    use sdk::Calldata;
-
-    let tx_hash = pending.tx_id.1.clone();
-    let calldata = Calldata {
-        identity: pending.hyli_tx.identity.clone(),
-        tx_hash,
-        private_input: vec![],
-        blobs: pending.hyli_tx.blobs.clone().into(),
-        index: pending.blob_index,
-        tx_ctx: Some((*pending.tx_ctx).clone()),
-        tx_blob_count: pending.hyli_tx.blobs.len(),
-    };
-
-    let calldata_bytes = borsh_to_vec(&calldata)
-        .map_err(|e| anyhow::anyhow!("Failed to borsh-encode calldata: {e}"))?;
-
-    let stateless_bytes = build_stateless_input(eth_state, &pending.raw_eip2718)?;
-
-    let evm_config_json =
-        serde_json::to_vec(&eth_state.chain_config).context("Serializing chain config")?;
-
-    let mut payload = Vec::new();
-    write_segment(&mut payload, &calldata_bytes);
-    write_segment(&mut payload, &stateless_bytes);
-    write_segment(&mut payload, &evm_config_json);
-
-    Ok(payload)
-}
-
 /// Submit a reth `ProofTransaction` to the Hyli node.
 pub async fn submit_reth_proof(
     node: &client_sdk::rest_client::NodeApiHttpClient,
@@ -289,123 +460,6 @@ pub async fn submit_reth_proof(
 
     let tx_hash = node.send_tx_proof(proof_tx).await?;
     Ok(tx_hash)
-}
-
-// ── Core: build_stateless_input ───────────────────────────────────────────────
-
-/// Build the bincode-encoded `StatelessInput` for a single EIP-2718 transaction.
-pub fn build_stateless_input(eth_state: &EthChainState, raw_eip2718: &[u8]) -> Result<Vec<u8>> {
-    let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
-        .context("Failed to decode EIP-2718 transaction")?;
-    let signer = tx
-        .recover_signer()
-        .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
-
-    let parent = eth_state
-        .header_history
-        .back()
-        .ok_or_else(|| anyhow::anyhow!("No parent header in history"))?
-        .clone();
-
-    // ── Step 1: Execute to collect witness record + state diff ────────────
-
-    let mut db = build_cache_db(&eth_state.accounts);
-    let evm_config = EthEvmConfig::new(eth_state.chain_spec.clone());
-
-    // First pass with placeholder state_root to get the execution output.
-    let block_placeholder = build_synthetic_block_inner(
-        tx.clone(),
-        signer,
-        &parent,
-        eth_state.block_number + 1,
-        &eth_state.chain_spec,
-        B256::ZERO,
-    )?;
-
-    let mut witness_record = ExecutionWitnessRecord::default();
-    let output = evm_config
-        .executor(&mut db)
-        .execute_with_state_closure(&block_placeholder, |state_db| {
-            witness_record.record_executed_state(state_db);
-        })
-        .context("EVM execution failed in build_stateless_input")?;
-
-    // ── Step 2: Compute pre-state proof nodes ─────────────────────────────
-
-    let hashed_state = &witness_record.hashed_state;
-    let account_proof_targets: Vec<B256> = hashed_state.accounts.keys().cloned().collect();
-
-    let (pre_state_root, mut witness_nodes) =
-        build_account_trie_with_proofs(&eth_state.accounts, &account_proof_targets);
-
-    if pre_state_root != eth_state.state_root {
-        warn!(
-            computed = %pre_state_root,
-            tracked = %eth_state.state_root,
-            "Pre-state trie root mismatch vs tracked state root"
-        );
-    }
-
-    // Add storage proof nodes for accessed storage.
-    for (hashed_addr, hashed_storage) in &hashed_state.storages {
-        let addr = find_address_by_hash(&eth_state.accounts, hashed_addr);
-        let empty_storage: HashMap<U256, U256> = HashMap::new();
-        let storage = addr
-            .and_then(|a| eth_state.accounts.get(&a))
-            .map(|s| &s.storage)
-            .unwrap_or(&empty_storage);
-
-        let storage_targets: Vec<B256> = hashed_storage.storage.keys().cloned().collect();
-        let (_, storage_nodes) = build_storage_trie_with_proofs(storage, &storage_targets);
-        witness_nodes.extend(storage_nodes);
-    }
-
-    // ── Step 3: Compute post-state root ──────────────────────────────────
-
-    let hashed_post = HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(
-        &output.state.state,
-    );
-    let post_state_root = compute_post_state_root(&eth_state.accounts, &hashed_post)?;
-
-    // ── Step 4: Build final block with correct post-state root ────────────
-
-    let final_block = build_synthetic_block_inner(
-        tx,
-        signer,
-        &parent,
-        eth_state.block_number + 1,
-        &eth_state.chain_spec,
-        post_state_root,
-    )?;
-
-    // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
-
-    let headers: Vec<Bytes> = eth_state
-        .header_history
-        .iter()
-        .map(|h| {
-            let mut buf = Vec::new();
-            h.header().encode(&mut buf);
-            Bytes::from(buf)
-        })
-        .collect();
-
-    let witness = ExecutionWitness {
-        state: witness_nodes,
-        codes: witness_record.codes,
-        keys: witness_record.keys,
-        headers,
-    };
-
-    // ── Step 6: Assemble StatelessInput and serialize ─────────────────────
-
-    let stateless_input = StatelessInput {
-        block: final_block.into_block(),
-        witness,
-        chain_config: eth_state.chain_config.clone(),
-    };
-
-    bincode::serialize(&stateless_input).context("bincode serialization of StatelessInput failed")
 }
 
 // ── Trie helpers ──────────────────────────────────────────────────────────────
@@ -508,12 +562,7 @@ fn compute_post_state_root(
             }
             (None, Some(_info)) => {
                 // New account created during execution; we don't know the address
-                // since we only have the hash. Insert a placeholder so the trie
-                // includes it (the verifier recomputes from scratch, so this is
-                // only needed for the state root computation here).
-                // We cannot reverse the hash, so we skip unknown new accounts for
-                // the root computation; the verifier will compute it correctly from
-                // the BundleState.
+                // since we only have the hash. Skip for root estimation.
                 debug!(
                     hashed_addr = %hashed_addr,
                     "New account from execution; unknown address — skipping for post-root"
@@ -541,9 +590,8 @@ fn compute_post_state_root(
                         }
                     }
                     None if !value.is_zero() => {
-                        // New storage slot; we can't reverse the hash but the
-                        // verifier recomputes this correctly. Skip for root
-                        // estimation.
+                        // New storage slot; we can't reverse the hash.
+                        // Skip for root estimation.
                     }
                     None => {}
                 }
@@ -694,73 +742,6 @@ fn calc_next_base_fee(parent: &Header, _chain_spec: &ChainSpec) -> u64 {
         let delta = parent_base_fee.saturating_mul(gas_target - gas_used) / gas_target / DENOM;
         parent_base_fee.saturating_sub(delta)
     }
-}
-
-// ── State application helpers ─────────────────────────────────────────────────
-
-/// Merge `BundleState` into the flat `accounts` map.
-pub fn merge_bundle_into_accounts(
-    accounts: &mut HashMap<Address, AccountState>,
-    bundle: &BundleState,
-) {
-    for (addr, bundle_account) in bundle.state() {
-        match &bundle_account.info {
-            None => {
-                accounts.remove(addr);
-            }
-            Some(info) => {
-                let entry = accounts.entry(*addr).or_default();
-                entry.nonce = info.nonce;
-                entry.balance = info.balance;
-                entry.code_hash = info.code_hash;
-                if let Some(code) = &info.code {
-                    let raw: Bytes = code.original_bytes();
-                    entry.code = raw;
-                }
-                for (slot, storage_slot) in &bundle_account.storage {
-                    let slot_u256 = U256::from(*slot);
-                    let present: U256 = storage_slot.present_value();
-                    if present.is_zero() {
-                        entry.storage.remove(&slot_u256);
-                    } else {
-                        entry.storage.insert(slot_u256, present);
-                    }
-                }
-            }
-        }
-    }
-}
-
-// ── CacheDB builder ───────────────────────────────────────────────────────────
-
-/// Build a `CacheDB<EmptyDB>` from our flat account state.
-pub fn build_cache_db(accounts: &HashMap<Address, AccountState>) -> CacheDB<EmptyDB> {
-    let mut db = CacheDB::new(EmptyDB::default());
-
-    for (addr, state) in accounts {
-        let bytecode = if state.code.is_empty() {
-            Bytecode::default()
-        } else {
-            Bytecode::new_raw(state.code.clone())
-        };
-
-        let info = AccountInfo {
-            balance: state.balance,
-            nonce: state.nonce,
-            code_hash: state.code_hash,
-            code: Some(bytecode),
-            account_id: None,
-        };
-
-        db.insert_account_info(*addr, info);
-
-        for (slot, value) in &state.storage {
-            db.insert_account_storage(*addr, *slot, *value)
-                .expect("insert_account_storage should not fail with EmptyDB");
-        }
-    }
-
-    db
 }
 
 // ── Write segment helper ──────────────────────────────────────────────────────

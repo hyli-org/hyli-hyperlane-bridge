@@ -5,8 +5,7 @@ pub mod types;
 use anyhow::{Context, Result};
 use axum::{extract::State, http::Method, routing::post, Json, Router};
 use eth_chain_state::{
-    build_reth_proof_payload, extract_pending_proof, submit_reth_proof, EthChainState,
-    PendingProofsMap,
+    extract_pending_proof, submit_reth_proof, EthChainState, PendingProofsMap,
 };
 use hyli_modules::{
     bus::SharedMessageBus,
@@ -252,7 +251,7 @@ impl RethModule {
 
         let tx_id = pending.tx_id.clone();
 
-        match build_reth_proof_payload(&pending, &eth_state_snapshot).await {
+        match eth_state_snapshot.build_proof_payload(&pending) {
             Ok(proof_bytes) => {
                 match submit_reth_proof(
                     self.node_client.as_ref(),
