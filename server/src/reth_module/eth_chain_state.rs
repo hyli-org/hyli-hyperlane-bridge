@@ -313,9 +313,21 @@ impl EthChainState {
             })
             .collect();
 
+        // Supplement witness codes with ALL known contract bytecodes.
+        // `record_executed_state` only captures contracts created in this transaction
+        // (via bundle_state). Pre-existing contracts called via CALL/DELEGATECALL are
+        // loaded from the CacheDB but don't appear in bundle_state.contracts, so the
+        // stateless verifier can't find their bytecode. Include everything we know.
+        let mut codes = witness_record.codes;
+        for account in self.accounts.values() {
+            if !account.code.is_empty() {
+                codes.push(account.code.clone());
+            }
+        }
+
         let witness = ExecutionWitness {
             state: witness_nodes,
-            codes: witness_record.codes,
+            codes,
             keys: witness_record.keys,
             headers,
         };
