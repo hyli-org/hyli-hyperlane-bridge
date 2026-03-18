@@ -139,6 +139,21 @@ fn block_json_from_header(h: &reth_primitives_traits::SealedHeader) -> Value {
     })
 }
 
+pub fn eth_get_code(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let addr = parse_address_param(params, 0);
+    let code_hex = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| {
+            s.accounts
+                .get(&addr)
+                .map(|a| format!("0x{}", hex::encode(&a.code)))
+                .unwrap_or_else(|| "0x".to_string())
+        })
+        .unwrap_or_else(|_| "0x".to_string());
+    JsonRpcResponse::ok(id, json!(code_hex))
+}
+
 pub fn eth_get_balance(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
     let balance = ctx
