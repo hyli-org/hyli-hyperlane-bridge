@@ -85,8 +85,11 @@ pub fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
 pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let block_tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("latest");
 
-    let header = ctx.eth_chain_state.read().ok().and_then(|state| {
-        match block_tag {
+    let header = ctx
+        .eth_chain_state
+        .read()
+        .ok()
+        .and_then(|state| match block_tag {
             "latest" | "pending" => state.latest_header(),
             "earliest" => state.get_header_by_number(0),
             tag => {
@@ -95,8 +98,7 @@ pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> Js
                     .ok()
                     .and_then(|n| state.get_header_by_number(n))
             }
-        }
-    });
+        });
 
     match header {
         Some(h) => JsonRpcResponse::ok(id, block_json_from_header(&h)),

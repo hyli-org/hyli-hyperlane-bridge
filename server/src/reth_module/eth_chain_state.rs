@@ -343,7 +343,10 @@ impl EthChainState {
     }
 
     pub fn account_balance(&self, addr: &Address) -> U256 {
-        self.accounts.get(addr).map(|a| a.balance).unwrap_or_default()
+        self.accounts
+            .get(addr)
+            .map(|a| a.balance)
+            .unwrap_or_default()
     }
 
     pub fn account_nonce(&self, addr: &Address) -> u64 {

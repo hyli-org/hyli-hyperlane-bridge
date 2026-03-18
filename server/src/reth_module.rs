@@ -4,9 +4,7 @@ pub mod types;
 
 use anyhow::{Context, Result};
 use axum::{extract::State, http::Method, routing::post, Json, Router};
-use eth_chain_state::{
-    extract_pending_proof, submit_reth_proof, EthChainState, PendingProofsMap,
-};
+use eth_chain_state::{extract_pending_proof, submit_reth_proof, EthChainState, PendingProofsMap};
 use hyli_modules::{
     bus::SharedMessageBus,
     module_bus_client, module_handle_messages,

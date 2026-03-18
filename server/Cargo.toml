@@ -8,7 +8,6 @@ client-sdk = { workspace = true, features = ["rest", "risc0"] }
 hyli-modules = { workspace = true, features = ["db", "risc0"] }
 hyli-model = { workspace = true }
 hyperlane-bridge = { workspace = true, features = ["client"] }
-smt-token = { workspace = true }
 
 alloy-consensus = { workspace = true }
 alloy-eips = { workspace = true }
@@ -17,7 +16,6 @@ alloy-sol-types = { workspace = true }
 alloy-genesis = { workspace = true }
 alloy-trie = { workspace = true }
 alloy-rlp = { workspace = true }
-alloy-rpc-types-debug = { workspace = true }
 
 reth-stateless = { workspace = true }
 reth-revm = { workspace = true }
@@ -25,7 +23,6 @@ reth-evm-ethereum = { workspace = true }
 reth-evm = { workspace = true }
 reth-chainspec = { workspace = true }
 reth-trie-common = { workspace = true }
-reth-trie = { workspace = true }
 reth-ethereum-primitives = { workspace = true }
 reth-primitives-traits = { workspace = true }
 revm = { workspace = true }
@@ -34,7 +31,6 @@ bincode = { workspace = true }
 config = { workspace = true, default-features = false, features = ["toml"] }
 axum = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
-tokio-util = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -44,6 +40,4 @@ indexmap = "2"
 k256 = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
-opentelemetry = { workspace = true }
-prometheus = { workspace = true }
 tower-http = { workspace = true, features = ["cors"] }

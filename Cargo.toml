@@ -25,7 +25,9 @@ alloy-rlp = { version = "0.3", default-features = false }
 alloy-rpc-types-debug = { version = "1.6", default-features = false }
 
 reth-stateless = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
-reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8", features = ["witness"] }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8", features = [
+    "witness",
+] }
 reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
 reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
 reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }

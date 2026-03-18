@@ -14,9 +14,6 @@ use sdk::{
 #[cfg(feature = "client")]
 pub mod client;
 
-#[cfg(feature = "server")]
-pub mod server;
-
 /// Policy contract state — holds the name of the companion reth contract to inspect.
 #[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
 pub struct HyperlaneBridgeState {
