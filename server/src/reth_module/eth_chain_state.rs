@@ -1,9 +1,10 @@
-use alloy_consensus::proofs::calculate_transaction_root;
+use alloy_consensus::proofs::{calculate_receipt_root, calculate_transaction_root};
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_consensus::Header;
+use alloy_consensus::TxReceipt;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_genesis::{ChainConfig, Genesis};
-use alloy_primitives::{keccak256, Address, Bloom, Bytes, B256, U256};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy_rlp::Encodable;
 use alloy_trie::{
     proof::ProofRetainer, HashBuilder, Nibbles, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY,
@@ -15,6 +16,7 @@ use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks};
 use reth_ethereum_primitives::{Block, BlockBody, Receipt, TransactionSigned};
 use reth_evm::{execute::Executor, ConfigureEvm};
 use reth_evm_ethereum::EthEvmConfig;
+use reth_primitives_traits::logs_bloom;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignerRecoverable};
 use reth_revm::witness::ExecutionWitnessRecord;
 use reth_stateless::{ExecutionWitness, StatelessInput};
@@ -149,48 +151,24 @@ impl EthChainState {
             .ok_or_else(|| anyhow::anyhow!("No parent header"))?
             .clone();
 
-        // Execute with placeholder gas_used=0/receipts_root/logs_bloom first to get actual values.
-        let block_placeholder = build_synthetic_block_inner(
-            tx.clone(),
-            signer,
-            &parent,
-            self.block_number + 1,
-            &self.chain_spec,
-            new_root,
-            0,
-            EMPTY_ROOT_HASH,
-            Bloom::ZERO,
-        )?;
+        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+        let exec_block =
+            build_exec_block(tx, signer, &parent, self.block_number + 1, &self.chain_spec)?;
 
         let mut db = self.build_cache_db();
-        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
         let output = evm_config
             .executor(&mut db)
-            .execute(&block_placeholder)
+            .execute(&exec_block)
             .context("EVM execution failed in apply_transaction")?;
 
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(&output.receipts);
-        let logs_bloom = compute_logs_bloom(&output.receipts);
-
-        // Rebuild the block with real gas_used + receipts_root + logs_bloom so stored header is valid.
-        let block = build_synthetic_block_inner(
-            tx,
-            signer,
-            &parent,
-            self.block_number + 1,
-            &self.chain_spec,
-            new_root,
-            output.gas_used,
-            receipts_root,
-            logs_bloom,
-        )?;
+        let final_block = finalize_block(exec_block, &output.receipts, output.gas_used, new_root);
 
         self.merge_bundle(&output.state);
 
         self.state_root = new_root;
         self.block_number += 1;
 
-        let new_header = SealedHeader::seal_slow(block.header().clone());
+        let new_header = SealedHeader::seal_slow(final_block.header().clone());
         self.header_history.push_back(new_header);
         if self.header_history.len() > 256 {
             self.header_history.pop_front();
@@ -255,26 +233,15 @@ impl EthChainState {
 
         // ── Step 1: Execute to collect witness record + state diff ────────────
 
-        let mut db = self.build_cache_db();
         let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+        let exec_block =
+            build_exec_block(tx, signer, &parent, self.block_number + 1, &self.chain_spec)?;
 
-        // First pass with placeholder header fields to get the execution output.
-        let block_placeholder = build_synthetic_block_inner(
-            tx.clone(),
-            signer,
-            &parent,
-            self.block_number + 1,
-            &self.chain_spec,
-            B256::ZERO,
-            0,
-            EMPTY_ROOT_HASH,
-            Bloom::ZERO,
-        )?;
-
+        let mut db = self.build_cache_db();
         let mut witness_record = ExecutionWitnessRecord::default();
         let output = evm_config
             .executor(&mut db)
-            .execute_with_state_closure(&block_placeholder, |state_db| {
+            .execute_with_state_closure(&exec_block, |state_db| {
                 witness_record.record_executed_state(state_db);
             })
             .context("EVM execution failed in build_stateless_input")?;
@@ -315,20 +282,12 @@ impl EthChainState {
 
         // ── Step 4: Build final block with all correct header fields ─────────
 
-        let receipts_root = Receipt::calculate_receipt_root_no_memo(&output.receipts);
-        let logs_bloom = compute_logs_bloom(&output.receipts);
-
-        let final_block = build_synthetic_block_inner(
-            tx,
-            signer,
-            &parent,
-            self.block_number + 1,
-            &self.chain_spec,
-            post_state_root,
+        let final_block = finalize_block(
+            exec_block,
+            &output.receipts,
             output.gas_used,
-            receipts_root,
-            logs_bloom,
-        )?;
+            post_state_root,
+        );
 
         // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
 
@@ -689,17 +648,6 @@ fn build_storage_trie_with_proofs(
     (storage_root, witness_nodes)
 }
 
-/// Compute the logs bloom from a list of receipts by accumulating log blooms.
-fn compute_logs_bloom(receipts: &[Receipt]) -> Bloom {
-    receipts
-        .iter()
-        .flat_map(|r| r.logs.iter())
-        .fold(Bloom::ZERO, |mut b, log| {
-            b.accrue_log(log);
-            b
-        })
-}
-
 /// Compute the post-state root by applying the bundle state diff onto a copy of `accounts`.
 ///
 /// Uses the raw `BundleState` (with actual `Address` keys) rather than `HashedPostState` so
@@ -754,17 +702,18 @@ fn find_address_by_hash(
 
 // ── Block construction ────────────────────────────────────────────────────────
 
-/// Construct a `RecoveredBlock<Block>` containing `tx` as the sole transaction.
-fn build_synthetic_block_inner(
+/// Build an execution-ready `RecoveredBlock<Block>` containing `tx` as the sole transaction.
+///
+/// All pre-execution header fields are set correctly (`base_fee_per_gas`, `transactions_root`,
+/// hardfork-specific fields, etc.). Output-derived fields (`state_root`, `gas_used`,
+/// `receipts_root`, `logs_bloom`) are left as zero-value placeholders; call
+/// [`finalize_block`] after execution to fill them in.
+fn build_exec_block(
     tx: TransactionSigned,
     signer: Address,
     parent: &SealedHeader,
     block_number: u64,
     chain_spec: &ChainSpec,
-    state_root: B256,
-    gas_used: u64,
-    receipts_root: B256,
-    logs_bloom: Bloom,
 ) -> Result<RecoveredBlock<Block>> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -812,15 +761,16 @@ fn build_synthetic_block_inner(
             "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
         ),
         beneficiary: Address::ZERO,
-        state_root,
+        // Placeholders — filled in by `finalize_block` after execution.
+        state_root: B256::ZERO,
+        receipts_root: B256::ZERO,
+        logs_bloom: Default::default(),
+        gas_used: 0,
         transactions_root,
-        receipts_root,
         withdrawals_root,
-        logs_bloom,
         difficulty: U256::ZERO,
         number: block_number,
         gas_limit: parent.gas_limit(),
-        gas_used,
         timestamp,
         mix_hash: B256::ZERO,
         nonce: alloy_primitives::B64::ZERO,
@@ -840,6 +790,33 @@ fn build_synthetic_block_inner(
 
     let block = Block { header, body };
     Ok(RecoveredBlock::new_unhashed(block, vec![signer]))
+}
+
+/// Patch output-derived header fields into a block after EVM execution.
+///
+/// Computes `receipts_root` and `logs_bloom` using the same functions as reth's
+/// `EthBlockAssembler`, then sets `state_root` and `gas_used` from the provided values.
+fn finalize_block(
+    exec_block: RecoveredBlock<Block>,
+    receipts: &[Receipt],
+    gas_used: u64,
+    state_root: B256,
+) -> RecoveredBlock<Block> {
+    let receipts_root = calculate_receipt_root(
+        &receipts
+            .iter()
+            .map(|r| r.with_bloom_ref())
+            .collect::<Vec<_>>(),
+    );
+    let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs.iter()));
+
+    let signers = exec_block.senders().to_vec();
+    let mut block = exec_block.into_block();
+    block.header.state_root = state_root;
+    block.header.gas_used = gas_used;
+    block.header.receipts_root = receipts_root;
+    block.header.logs_bloom = logs_bloom;
+    RecoveredBlock::new_unhashed(block, signers)
 }
 
 /// Build the genesis block header.

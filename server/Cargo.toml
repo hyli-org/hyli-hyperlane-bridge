@@ -10,6 +10,7 @@ hyli-model = { workspace = true }
 hyperlane-bridge = { workspace = true, features = ["client"] }
 
 alloy-consensus = { workspace = true }
+alloy-evm = { workspace = true }
 alloy-eips = { workspace = true }
 alloy-primitives = { workspace = true }
 alloy-sol-types = { workspace = true }
