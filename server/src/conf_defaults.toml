@@ -14,3 +14,37 @@ prover_tx_buffer_size = 0
 prover_max_txs_per_proof = 10
 prover_tx_working_window_size = 50
 prover_idle_flush_interval_secs = 2
+
+# EVM chain genesis (empty chain, all hardforks active from block/time 0, chainId matches hyli_chain_id)
+evm_config_json = '''
+{
+  "config": {
+    "chainId": 1337,
+    "homesteadBlock": 0,
+    "eip150Block": 0,
+    "eip155Block": 0,
+    "eip158Block": 0,
+    "byzantiumBlock": 0,
+    "constantinopleBlock": 0,
+    "petersburgBlock": 0,
+    "istanbulBlock": 0,
+    "berlinBlock": 0,
+    "londonBlock": 0,
+    "mergeNetsplitBlock": 0,
+    "shanghaiTime": 0,
+    "cancunTime": 0,
+    "terminalTotalDifficulty": 0,
+    "terminalTotalDifficultyPassed": true
+  },
+  "difficulty": "0x0",
+  "gasLimit": "0x1C9C380",
+  "timestamp": "0x0",
+  "extraData": "0x",
+  "baseFeePerGas": "0x3B9ACA00",
+  "alloc": {
+    "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266": {
+      "balance": "0x3635C9ADC5DEA00000"
+    }
+  }
+}
+'''

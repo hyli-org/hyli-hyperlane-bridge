@@ -291,6 +291,8 @@ async fn rpc_handler(
     let id = req.id.clone();
     let params = &req.params;
 
+    debug!(method = %req.method, params = %params, "RPC request");
+
     let resp = match req.method.as_str() {
         "eth_blockNumber" => handlers::eth_block_number(&ctx, id),
         "eth_chainId" => handlers::eth_chain_id(&ctx, id),
@@ -303,12 +305,19 @@ async fn rpc_handler(
         "eth_getTransactionReceipt" => {
             handlers::eth_get_transaction_receipt(&ctx, id, params).await
         }
-        "eth_estimateGas" => JsonRpcResponse::ok(id, serde_json::json!("0x186a0")),
+        // Return a generous gas estimate (5 M gas) to cover any contract deployment.
+        "eth_estimateGas" => JsonRpcResponse::ok(id, serde_json::json!("0x4C4B40")),
         "eth_getTransactionCount" => handlers::eth_get_transaction_count(&ctx, id, params),
         "eth_gasPrice" => handlers::eth_gas_price(&ctx, id),
         "eth_getBalance" => handlers::eth_get_balance(&ctx, id, params),
         other => JsonRpcResponse::method_not_found(id, other),
     };
+
+    if let Some(err) = resp.error.as_ref() {
+        warn!(method = %req.method, code = err.code, message = %err.message, "RPC error response");
+    } else {
+        debug!(method = %req.method, "RPC ok");
+    }
 
     Json(resp)
 }

@@ -414,6 +414,10 @@ pub async fn eth_send_raw_transaction(
         return JsonRpcResponse::err(id, -32602, "Failed to decode EIP-2718 transaction");
     }
 
+    // Compute the EVM tx hash before raw_bytes is moved into the blob.
+    // ethers.js v5 verifies the returned hash == keccak256(raw_eip2718_bytes).
+    let evm_tx_hash = alloy_primitives::keccak256(&raw_bytes);
+
     // Build the Hyli blob transaction:
     //   blob[0]: hyperlane reth blob  ← raw EIP-2718 bytes (proven by reth verifier)
     //   blob[1]: hyperlane-bridge blob ← VerifyTransaction (proven by RISC0)
@@ -433,18 +437,11 @@ pub async fn eth_send_raw_transaction(
     ];
 
     let blob_tx = BlobTransaction::new(ctx.relayer_identity.clone(), blobs);
-    let tx_hash = match ctx.node_client.send_tx_blob(blob_tx).await {
-        Ok(h) => h,
-        Err(e) => return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}")),
-    };
+    if let Err(e) = ctx.node_client.send_tx_blob(blob_tx).await {
+        return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}"));
+    }
 
-    let hash_str = tx_hash.to_string();
-    let padded = if hash_str.len() < 64 {
-        format!("{:0>64}", hash_str)
-    } else {
-        hash_str[..64].to_string()
-    };
-    JsonRpcResponse::ok(id, json!(format!("0x{}", padded)))
+    JsonRpcResponse::ok(id, json!(format!("0x{}", hex::encode(*evm_tx_hash))))
 }
 
 // ── eth_getTransactionReceipt ─────────────────────────────────────────────────
