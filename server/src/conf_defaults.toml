@@ -36,6 +36,7 @@ evm_config_json = '''
     "terminalTotalDifficulty": 0,
     "terminalTotalDifficultyPassed": true
   },
+  "nonce": "0x0000000000000000",
   "difficulty": "0x0",
   "gasLimit": "0x1C9C380",
   "timestamp": "0x0",

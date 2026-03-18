@@ -58,6 +58,11 @@ pub struct EthChainState {
     pub chain_spec: Arc<ChainSpec>,
     /// Chain config forwarded in `StatelessInput.chain_config`.
     pub chain_config: ChainConfig,
+    /// Full genesis JSON bytes, forwarded verbatim as the `evm_config` segment of the
+    /// reth proof payload. The node's reth verifier needs the complete genesis (alloc,
+    /// gasLimit, etc.) to reconstruct the ChainSpec — sending only `ChainConfig` is
+    /// insufficient and results in "evm config did not include a genesis specification".
+    pub genesis_json: Vec<u8>,
     /// Recent ancestor headers for BLOCKHASH opcode support (up to 256).
     /// The *last* element is the most recent (parent) header.
     pub header_history: VecDeque<SealedHeader>,
@@ -117,6 +122,7 @@ impl EthChainState {
             accounts,
             chain_spec,
             chain_config,
+            genesis_json: genesis_json.to_vec(),
             header_history,
         })
     }
@@ -201,8 +207,9 @@ impl EthChainState {
 
         let stateless_bytes = self.build_stateless_input(&pending.raw_eip2718)?;
 
-        let evm_config_json =
-            serde_json::to_vec(&self.chain_config).context("Serializing chain config")?;
+        // Send the full genesis JSON, not just chain_config. The node's reth verifier
+        // needs the complete genesis spec (alloc, gasLimit, etc.) to build a ChainSpec.
+        let evm_config_json = self.genesis_json.clone();
 
         let mut payload = Vec::new();
         write_segment(&mut payload, &calldata_bytes);
