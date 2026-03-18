@@ -37,9 +37,7 @@ pub struct RethModuleCtx {
     pub hyperlane_cn: ContractName,
     pub relayer_identity: sdk::Identity,
     pub api: Arc<BuildApiContextInner>,
-    /// Initial EVM state root for the hyperlane reth contract (32 bytes).
-    pub initial_eth_state_root: [u8; 32],
-    /// Genesis JSON for the EVM chain-spec (required).
+    /// Genesis JSON for the EVM chain-spec. The initial state root is derived from it.
     pub evm_config_json: Vec<u8>,
 }
 
@@ -59,7 +57,7 @@ impl Module for RethModule {
 
     async fn build(bus: SharedMessageBus, ctx: Self::Context) -> Result<Self> {
         let eth_chain_state = Arc::new(RwLock::new(
-            EthChainState::new(ctx.initial_eth_state_root, &ctx.evm_config_json)
+            EthChainState::new(&ctx.evm_config_json)
                 .context("Initializing EthChainState from genesis JSON")?,
         ));
 

@@ -2,7 +2,6 @@ node_url = "http://localhost:4321"
 server_port = 4000
 log_format = "full"
 hyli_chain_id = 1337
-eth_state_root = "0000000000000000000000000000000000000000000000000000000000000000"
 bridge_cn = "hyperlane-bridge"
 hyperlane_cn = "hyperlane"
 data_directory = "data/bridge-server"

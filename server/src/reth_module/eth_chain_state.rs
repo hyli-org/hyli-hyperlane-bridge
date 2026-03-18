@@ -66,8 +66,8 @@ pub struct EthChainState {
 impl EthChainState {
     /// Build `EthChainState` from a genesis JSON blob.
     ///
-    /// `initial_state_root` is the authoritative pre-state root stored on Hyli.
-    pub fn new(initial_state_root: [u8; 32], genesis_json: &[u8]) -> Result<Self> {
+    /// The initial state root is computed from the genesis alloc trie.
+    pub fn new(genesis_json: &[u8]) -> Result<Self> {
         let genesis: Genesis =
             serde_json::from_slice(genesis_json).context("Failed to parse genesis JSON")?;
 
@@ -101,7 +101,8 @@ impl EthChainState {
             );
         }
 
-        let state_root = B256::from(initial_state_root);
+        // Derive the state root from the genesis alloc trie.
+        let (state_root, _) = build_account_trie_with_proofs(&accounts, &[]);
 
         // Build the genesis (block 0) sealed header.
         let genesis_header = build_genesis_header(&genesis, state_root);
@@ -495,6 +496,44 @@ pub async fn submit_reth_proof(
 
     let tx_hash = node.send_tx_proof(proof_tx).await?;
     Ok(tx_hash)
+}
+
+// ── Genesis state root ────────────────────────────────────────────────────────
+
+/// Compute the state root for a genesis JSON blob without constructing the full
+/// `EthChainState`. Used during contract registration on Hyli.
+pub fn genesis_state_root(genesis_json: &[u8]) -> Result<[u8; 32]> {
+    let genesis: Genesis =
+        serde_json::from_slice(genesis_json).context("Failed to parse genesis JSON")?;
+
+    let mut accounts: HashMap<Address, AccountState> = HashMap::new();
+    for (addr, alloc) in &genesis.alloc {
+        let code: Bytes = alloc.code.clone().unwrap_or_default();
+        let code_hash = if code.is_empty() {
+            KECCAK_EMPTY
+        } else {
+            keccak256(&code)
+        };
+        let mut storage: HashMap<U256, U256> = HashMap::new();
+        if let Some(alloc_storage) = &alloc.storage {
+            for (slot, value) in alloc_storage {
+                storage.insert(U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0));
+            }
+        }
+        accounts.insert(
+            *addr,
+            AccountState {
+                balance: alloc.balance,
+                nonce: alloc.nonce.unwrap_or(0),
+                code,
+                code_hash,
+                storage,
+            },
+        );
+    }
+
+    let (root, _) = build_account_trie_with_proofs(&accounts, &[]);
+    Ok(root.into())
 }
 
 // ── Trie helpers ──────────────────────────────────────────────────────────────

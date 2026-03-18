@@ -67,25 +67,7 @@ async fn actual_main() -> Result<()> {
         openapi: Default::default(),
     });
 
-    let eth_state_root_bytes: [u8; 32] = {
-        let hex_str = conf.eth_state_root.trim_start_matches("0x");
-        let decoded = hex::decode(hex_str).context("Decoding eth_state_root hex")?;
-        decoded
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("eth_state_root must be exactly 32 bytes"))?
-    };
-
-    let evm_config_json = conf
-        .evm_config_json
-        .as_deref()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "evm_config_json is required: provide the Ethereum genesis JSON \
-                 (e.g. path to genesis.json contents) in the server config"
-            )
-        })?
-        .as_bytes()
-        .to_vec();
+    let evm_config_json = conf.evm_config_json.as_bytes().to_vec();
 
     handler
         .build_module::<RethModule>(RethModuleCtx {
@@ -96,7 +78,6 @@ async fn actual_main() -> Result<()> {
             bridge_cn: ContractName(conf.bridge_cn.clone()),
             hyperlane_cn: ContractName(conf.hyperlane_cn.clone()),
             relayer_identity,
-            initial_eth_state_root: eth_state_root_bytes,
             evm_config_json,
         })
         .await?;

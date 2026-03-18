@@ -12,6 +12,7 @@ use std::time::Duration;
 use tracing::info;
 
 use crate::conf::Conf;
+use crate::reth_module::eth_chain_state::genesis_state_root;
 
 /// Derives a 65-byte uncompressed secp256k1 public key from a contract name.
 /// Matches the `derive_program_pubkey` logic in the reth-verifier.
@@ -62,8 +63,9 @@ pub async fn init_contracts(conf: &Conf, node: Arc<NodeApiHttpClient>) -> Result
     }
 
     // ── Contract B: hyperlane (reth verifier) ─────────────────────────────────
-    let eth_state_root_hex = conf.eth_state_root.trim_start_matches("0x");
-    let eth_state_root = hex::decode(eth_state_root_hex).context("Decoding eth_state_root hex")?;
+    let eth_state_root = genesis_state_root(conf.evm_config_json.as_bytes())
+        .context("Computing genesis state root from evm_config_json")?
+        .to_vec();
 
     match node.get_contract(hyperlane_cn.clone()).await {
         Ok(_) => info!(

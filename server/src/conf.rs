@@ -28,8 +28,6 @@ pub struct Conf {
     pub log_format: String,
     /// Domain ID shown to Hyperlane agents
     pub hyli_chain_id: u64,
-    /// 32-byte hex state root of the Ethereum chain with Hyperlane contracts deployed
-    pub eth_state_root: String,
     pub bridge_cn: String,
     pub hyperlane_cn: String,
     /// Hex-encoded secp256k1 private key used to sign Hyli transactions (relayer path)
@@ -39,10 +37,9 @@ pub struct Conf {
     /// Skip contract deployment on startup
     pub noinit: bool,
 
-    /// EVM chain-spec JSON used when building reth proof payloads.
-    /// Must match the genesis / chain configuration of the Hyli-hosted EVM.
-    /// Leave as `None` (or omit from config) until a reth executor is wired up.
-    pub evm_config_json: Option<String>,
+    /// Genesis JSON for the Hyli-hosted EVM chain. Used to derive the initial state root
+    /// for contract registration and to initialise the in-process EVM (EthChainState).
+    pub evm_config_json: String,
 
     // ── ContractListener / AutoProver ─────────────────────────────────────────
     /// PostgreSQL connection URL for the ContractListener (e.g. postgres://user:pass@host/db)
