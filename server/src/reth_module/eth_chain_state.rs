@@ -149,6 +149,25 @@ impl EthChainState {
             .ok_or_else(|| anyhow::anyhow!("No parent header"))?
             .clone();
 
+        // Execute with placeholder gas_used=0 first to get actual gas consumed.
+        let block_placeholder = build_synthetic_block_inner(
+            tx.clone(),
+            signer,
+            &parent,
+            self.block_number + 1,
+            &self.chain_spec,
+            new_root,
+            0,
+        )?;
+
+        let mut db = self.build_cache_db();
+        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+        let output = evm_config
+            .executor(&mut db)
+            .execute(&block_placeholder)
+            .context("EVM execution failed in apply_transaction")?;
+
+        // Rebuild the block with the real gas_used so the stored header is valid.
         let block = build_synthetic_block_inner(
             tx,
             signer,
@@ -156,14 +175,8 @@ impl EthChainState {
             self.block_number + 1,
             &self.chain_spec,
             new_root,
+            output.gas_used,
         )?;
-
-        let mut db = self.build_cache_db();
-        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
-        let output = evm_config
-            .executor(&mut db)
-            .execute(&block)
-            .context("EVM execution failed in apply_transaction")?;
 
         self.merge_bundle(&output.state);
 
@@ -238,7 +251,7 @@ impl EthChainState {
         let mut db = self.build_cache_db();
         let evm_config = EthEvmConfig::new(self.chain_spec.clone());
 
-        // First pass with placeholder state_root to get the execution output.
+        // First pass with placeholder state_root/gas_used to get the execution output.
         let block_placeholder = build_synthetic_block_inner(
             tx.clone(),
             signer,
@@ -246,6 +259,7 @@ impl EthChainState {
             self.block_number + 1,
             &self.chain_spec,
             B256::ZERO,
+            0,
         )?;
 
         let mut witness_record = ExecutionWitnessRecord::default();
@@ -290,7 +304,7 @@ impl EthChainState {
 
         let post_state_root = compute_post_state_root(&self.accounts, &output.state);
 
-        // ── Step 4: Build final block with correct post-state root ────────────
+        // ── Step 4: Build final block with correct post-state root + gas_used ───
 
         let final_block = build_synthetic_block_inner(
             tx,
@@ -299,6 +313,7 @@ impl EthChainState {
             self.block_number + 1,
             &self.chain_spec,
             post_state_root,
+            output.gas_used,
         )?;
 
         // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
@@ -722,6 +737,7 @@ fn build_synthetic_block_inner(
     block_number: u64,
     chain_spec: &ChainSpec,
     state_root: B256,
+    gas_used: u64,
 ) -> Result<RecoveredBlock<Block>> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -777,7 +793,7 @@ fn build_synthetic_block_inner(
         difficulty: U256::ZERO,
         number: block_number,
         gas_limit: parent.gas_limit(),
-        gas_used: 0,
+        gas_used,
         timestamp,
         mix_hash: B256::ZERO,
         nonce: alloy_primitives::B64::ZERO,
