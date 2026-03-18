@@ -1,3 +1,4 @@
+use alloy_consensus::proofs::calculate_transaction_root;
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_consensus::Header;
 use alloy_eips::eip2718::Decodable2718;
@@ -17,7 +18,6 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignerRecoverable};
 use reth_revm::witness::ExecutionWitnessRecord;
 use reth_stateless::{ExecutionWitness, StatelessInput};
-use reth_trie_common::HashedPostState;
 use revm::database::{BundleState, CacheDB, EmptyDB};
 use revm::state::{AccountInfo, Bytecode};
 use sdk::{
@@ -288,10 +288,7 @@ impl EthChainState {
 
         // ── Step 3: Compute post-state root ──────────────────────────────────
 
-        let hashed_post = HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(
-            &output.state.state,
-        );
-        let post_state_root = compute_post_state_root(&self.accounts, &hashed_post)?;
+        let post_state_root = compute_post_state_root(&self.accounts, &output.state);
 
         // ── Step 4: Build final block with correct post-state root ────────────
 
@@ -371,6 +368,45 @@ impl EthChainState {
     /// Returns a clone of the most recent sealed header.
     pub fn latest_header(&self) -> Option<SealedHeader> {
         self.header_history.back().cloned()
+    }
+
+    /// Push a minimal synthetic sealed header after a fallback (non-EVM) state update.
+    ///
+    /// This keeps `header_history` in sync with `block_number` so that the next proof
+    /// correctly chains from the most-recent block rather than from a stale ancestor.
+    /// Without this, `build_stateless_input` would claim the wrong block number in the
+    /// proof payload, triggering "invalid ancestor chain" at stateless validation.
+    pub fn push_fallback_header(&mut self) {
+        let parent = self.header_history.back();
+        let parent_hash = parent.map(|h| h.hash()).unwrap_or_default();
+        let parent_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
+        let parent_timestamp = parent.map(|h| h.timestamp()).unwrap_or(0);
+        let parent_base_fee = parent.and_then(|h| h.base_fee_per_gas());
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .max(parent_timestamp + 1);
+
+        let header = Header {
+            parent_hash,
+            number: self.block_number,
+            state_root: self.state_root,
+            gas_limit: parent_gas_limit,
+            timestamp,
+            base_fee_per_gas: parent_base_fee,
+            ommers_hash: alloy_primitives::b256!(
+                "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+            ),
+            ..Default::default()
+        };
+
+        let sealed = SealedHeader::seal_slow(header);
+        self.header_history.push_back(sealed);
+        if self.header_history.len() > 256 {
+            self.header_history.pop_front();
+        }
     }
 
     fn build_cache_db(&self) -> CacheDB<EmptyDB> {
@@ -624,67 +660,45 @@ fn build_storage_trie_with_proofs(
     (storage_root, witness_nodes)
 }
 
-/// Compute the post-state root by applying `hashed_post` onto a copy of `accounts`.
+/// Compute the post-state root by applying the bundle state diff onto a copy of `accounts`.
+///
+/// Uses the raw `BundleState` (with actual `Address` keys) rather than `HashedPostState` so
+/// that newly created accounts (e.g. contract deployments) are handled correctly — their
+/// addresses are available directly without needing to reverse a keccak hash.
 fn compute_post_state_root(
     accounts: &HashMap<Address, AccountState>,
-    hashed_post: &HashedPostState,
-) -> Result<B256> {
+    bundle: &BundleState,
+) -> B256 {
     let mut updated = accounts.clone();
 
-    // Apply account changes.
-    for (hashed_addr, post_account) in &hashed_post.accounts {
-        let addr = find_address_by_hash(accounts, hashed_addr);
-        match (addr, post_account) {
-            (Some(a), Some(info)) => {
-                let entry = updated.entry(a).or_default();
+    for (addr, bundle_account) in bundle.state() {
+        match &bundle_account.info {
+            None => {
+                updated.remove(addr);
+            }
+            Some(info) => {
+                let entry = updated.entry(*addr).or_default();
                 entry.nonce = info.nonce;
                 entry.balance = info.balance;
-                entry.code_hash = info.bytecode_hash.unwrap_or(KECCAK_EMPTY);
-            }
-            (Some(a), None) => {
-                updated.remove(&a);
-            }
-            (None, Some(_info)) => {
-                // New account created during execution; we don't know the address
-                // since we only have the hash. Skip for root estimation.
-                debug!(
-                    hashed_addr = %hashed_addr,
-                    "New account from execution; unknown address — skipping for post-root"
-                );
-            }
-            (None, None) => {} // deleted but wasn't tracked — ignore
-        }
-    }
-
-    // Apply storage changes.
-    for (hashed_addr, hashed_storage) in &hashed_post.storages {
-        if let Some(addr) = find_address_by_hash(accounts, hashed_addr) {
-            let entry = updated.entry(addr).or_default();
-            if hashed_storage.wiped {
-                entry.storage.clear();
-            }
-            for (hashed_slot, value) in &hashed_storage.storage {
-                let slot = find_slot_by_hash(&entry.storage, hashed_slot);
-                match slot {
-                    Some(s) => {
-                        if value.is_zero() {
-                            entry.storage.remove(&s);
-                        } else {
-                            entry.storage.insert(s, *value);
-                        }
+                entry.code_hash = info.code_hash;
+                if let Some(code) = &info.code {
+                    entry.code = code.original_bytes();
+                }
+                for (slot, storage_slot) in &bundle_account.storage {
+                    let slot_u256 = U256::from(*slot);
+                    let present = storage_slot.present_value();
+                    if present.is_zero() {
+                        entry.storage.remove(&slot_u256);
+                    } else {
+                        entry.storage.insert(slot_u256, present);
                     }
-                    None if !value.is_zero() => {
-                        // New storage slot; we can't reverse the hash.
-                        // Skip for root estimation.
-                    }
-                    None => {}
                 }
             }
         }
     }
 
     let (post_root, _) = build_account_trie_with_proofs(&updated, &[]);
-    Ok(post_root)
+    post_root
 }
 
 /// Find the `Address` whose `keccak256(addr) == hashed_addr`.
@@ -695,14 +709,6 @@ fn find_address_by_hash(
     accounts
         .keys()
         .find(|addr| keccak256(*addr) == *hashed_addr)
-        .copied()
-}
-
-/// Find the `U256` slot whose `keccak256(B256::from(slot)) == hashed_slot`.
-fn find_slot_by_hash(storage: &HashMap<U256, U256>, hashed_slot: &B256) -> Option<U256> {
-    storage
-        .keys()
-        .find(|slot| keccak256(B256::from(**slot)) == *hashed_slot)
         .copied()
 }
 
@@ -755,6 +761,8 @@ fn build_synthetic_block_inner(
         None
     };
 
+    let transactions_root = calculate_transaction_root(std::slice::from_ref(&tx));
+
     let header = Header {
         parent_hash: parent.hash(),
         ommers_hash: alloy_primitives::b256!(
@@ -762,7 +770,7 @@ fn build_synthetic_block_inner(
         ),
         beneficiary: Address::ZERO,
         state_root,
-        transactions_root: EMPTY_ROOT_HASH,
+        transactions_root,
         receipts_root: EMPTY_ROOT_HASH,
         withdrawals_root,
         logs_bloom: Default::default(),

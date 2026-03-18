@@ -212,10 +212,14 @@ impl RethModule {
                             );
                             state.state_root = alloy_primitives::B256::from(new_root);
                             state.block_number += 1;
+                            // Keep header_history in sync with block_number so the next
+                            // proof has a valid parent header (avoids "invalid ancestor chain").
+                            state.push_fallback_header();
                         }
                     } else {
                         state.state_root = alloy_primitives::B256::from(new_root);
                         state.block_number += 1;
+                        state.push_fallback_header();
                     }
                     debug!(
                         tx_id =% tx_id,
