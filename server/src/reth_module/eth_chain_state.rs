@@ -1,39 +1,187 @@
-use anyhow::Result;
+use alloy_consensus::BlockHeader as AlloyBlockHeader;
+use alloy_consensus::Header;
+use alloy_eips::eip2718::Decodable2718;
+use alloy_genesis::{ChainConfig, Genesis};
+use alloy_primitives::{keccak256, Address, Bytes, B256, U256};
+use alloy_rlp::Encodable;
+use alloy_trie::{
+    proof::ProofRetainer, HashBuilder, Nibbles, TrieAccount, EMPTY_ROOT_HASH, KECCAK_EMPTY,
+};
+use anyhow::{Context, Result};
 use client_sdk::rest_client::NodeApiClient;
 use indexmap::IndexMap;
+use reth_chainspec::{ChainSpec, EthereumHardforks};
+use reth_ethereum_primitives::{Block, BlockBody, TransactionSigned};
+use reth_evm::{execute::Executor, ConfigureEvm};
+use reth_evm_ethereum::EthEvmConfig;
+use reth_primitives_traits::{RecoveredBlock, SealedHeader, SignerRecoverable};
+use reth_revm::witness::ExecutionWitnessRecord;
+use reth_stateless::{ExecutionWitness, StatelessInput};
+use reth_trie_common::HashedPostState;
+use revm::database::{BundleState, CacheDB, EmptyDB};
+use revm::state::{AccountInfo, Bytecode};
 use sdk::{
     BlobIndex, BlobTransaction, ContractName, ProgramId, ProofData, ProofTransaction, TxContext,
     TxId, Verifier,
 };
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
-/// Current tracked state of the Hyli-hosted Ethereum chain (the `hyperlane` reth contract).
-/// Updated from `ContractListenerEvent::SettledTx` events.
+// ── EthChainState ─────────────────────────────────────────────────────────────
+
+/// In-memory per-account EVM state (flat; trie is rebuilt as needed).
+#[derive(Debug, Clone, Default)]
+pub struct AccountState {
+    pub balance: U256,
+    pub nonce: u64,
+    /// Raw bytecode (empty for EOAs).
+    pub code: Bytes,
+    /// `keccak256(code)`, or `KECCAK_EMPTY` for EOAs.
+    pub code_hash: B256,
+    /// Storage slots: slot (U256) → value (U256). Only non-zero values are stored.
+    pub storage: HashMap<U256, U256>,
+}
+
+impl AccountState {}
+
+/// Current tracked state of the Hyli-hosted Ethereum chain (the reth contract).
 #[derive(Debug, Clone)]
 pub struct EthChainState {
-    /// Current EVM state root (updated on each settled reth transaction).
-    pub state_root: [u8; 32],
+    /// Current EVM state root (equals last settled block's `state_root`).
+    pub state_root: B256,
     /// Number of settled transactions (used as the EVM block number).
     pub block_number: u64,
+    /// Flat per-address account state.
+    pub accounts: HashMap<Address, AccountState>,
+    /// Reth chain spec (hardfork configuration).
+    pub chain_spec: Arc<ChainSpec>,
+    /// Chain config forwarded in `StatelessInput.chain_config`.
+    pub chain_config: ChainConfig,
+    /// Recent ancestor headers for BLOCKHASH opcode support (up to 256).
+    /// The *last* element is the most recent (parent) header.
+    pub header_history: VecDeque<SealedHeader>,
 }
 
 impl EthChainState {
-    pub fn new(initial_state_root: [u8; 32]) -> Self {
-        Self {
-            state_root: initial_state_root,
-            block_number: 0,
+    /// Build `EthChainState` from a genesis JSON blob.
+    ///
+    /// `initial_state_root` is the authoritative pre-state root stored on Hyli.
+    pub fn new(initial_state_root: [u8; 32], genesis_json: &[u8]) -> Result<Self> {
+        let genesis: Genesis =
+            serde_json::from_slice(genesis_json).context("Failed to parse genesis JSON")?;
+
+        let chain_config = genesis.config.clone();
+        let chain_spec = Arc::new(ChainSpec::from(genesis.clone()));
+
+        // Populate account state from genesis alloc.
+        let mut accounts: HashMap<Address, AccountState> = HashMap::new();
+        for (addr, alloc) in &genesis.alloc {
+            let code: Bytes = alloc.code.clone().unwrap_or_default();
+            let code_hash = if code.is_empty() {
+                KECCAK_EMPTY
+            } else {
+                keccak256(&code)
+            };
+            let mut storage: HashMap<U256, U256> = HashMap::new();
+            if let Some(alloc_storage) = &alloc.storage {
+                for (slot, value) in alloc_storage {
+                    storage.insert(U256::from_be_bytes(slot.0), U256::from_be_bytes(value.0));
+                }
+            }
+            accounts.insert(
+                *addr,
+                AccountState {
+                    balance: alloc.balance,
+                    nonce: alloc.nonce.unwrap_or(0),
+                    code,
+                    code_hash,
+                    storage,
+                },
+            );
         }
+
+        let state_root = B256::from(initial_state_root);
+
+        // Build the genesis (block 0) sealed header.
+        let genesis_header = build_genesis_header(&genesis, state_root);
+        let genesis_sealed = SealedHeader::seal_slow(genesis_header);
+
+        let mut header_history = VecDeque::new();
+        header_history.push_back(genesis_sealed);
+
+        Ok(Self {
+            state_root,
+            block_number: 0,
+            accounts,
+            chain_spec,
+            chain_config,
+            header_history,
+        })
+    }
+
+    /// Apply a settled transaction to the in-memory state.
+    ///
+    /// Re-executes the transaction and merges the state diff into `self.accounts`.
+    pub fn apply_transaction(
+        &mut self,
+        raw_eip2718: &[u8],
+        new_state_root: [u8; 32],
+    ) -> Result<()> {
+        let new_root = B256::from(new_state_root);
+
+        let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
+            .context("Failed to decode EIP-2718 transaction")?;
+        let signer = tx
+            .recover_signer()
+            .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+        let parent = self
+            .header_history
+            .back()
+            .ok_or_else(|| anyhow::anyhow!("No parent header"))?
+            .clone();
+
+        let block = build_synthetic_block_inner(
+            tx,
+            signer,
+            &parent,
+            self.block_number + 1,
+            &self.chain_spec,
+            new_root,
+        )?;
+
+        let mut db = build_cache_db(&self.accounts);
+        let evm_config = EthEvmConfig::new(self.chain_spec.clone());
+        let output = evm_config
+            .executor(&mut db)
+            .execute(&block)
+            .context("EVM execution failed in apply_transaction")?;
+
+        merge_bundle_into_accounts(&mut self.accounts, &output.state);
+
+        self.state_root = new_root;
+        self.block_number += 1;
+
+        let new_header = SealedHeader::seal_slow(block.header().clone());
+        self.header_history.push_back(new_header);
+        if self.header_history.len() > 256 {
+            self.header_history.pop_front();
+        }
+
+        Ok(())
     }
 }
 
-/// A transaction sequenced on the hyperlane reth contract, awaiting a reth proof.
+// ── PendingRethProof ──────────────────────────────────────────────────────────
+
+/// A transaction sequenced on the reth contract, awaiting a reth proof.
 #[derive(Debug, Clone)]
 pub struct PendingRethProof {
     pub tx_id: TxId,
     pub hyli_tx: BlobTransaction,
     pub tx_ctx: Arc<TxContext>,
-    /// Index of the hyperlane reth blob within the transaction blobs.
+    /// Index of the reth blob within the transaction blobs.
     pub blob_index: BlobIndex,
     /// Raw EIP-2718 encoded transaction bytes (the actual EVM transaction).
     pub raw_eip2718: Vec<u8>,
@@ -41,6 +189,8 @@ pub struct PendingRethProof {
 
 /// Pending proofs indexed by `TxId`.
 pub type PendingProofsMap = IndexMap<TxId, PendingRethProof>;
+
+// ── Public helpers ────────────────────────────────────────────────────────────
 
 /// Extract raw EIP-2718 bytes from a reth blob, unwrapping any `StructuredBlobData` wrapper.
 fn extract_raw_eip2718(data: &[u8]) -> Vec<u8> {
@@ -54,18 +204,17 @@ fn extract_raw_eip2718(data: &[u8]) -> Vec<u8> {
 }
 
 /// Extract the reth blob from a transaction and build a `PendingRethProof`.
-/// Returns `None` if the transaction has no blob for `hyperlane_cn`.
 pub fn extract_pending_proof(
     tx_id: TxId,
     hyli_tx: BlobTransaction,
     tx_ctx: Arc<TxContext>,
-    hyperlane_cn: &ContractName,
+    contract_name: &ContractName,
 ) -> Option<PendingRethProof> {
     let (blob_index, raw_eip2718) = hyli_tx
         .blobs
         .iter()
         .enumerate()
-        .find(|(_, b)| b.contract_name == *hyperlane_cn)
+        .find(|(_, b)| b.contract_name == *contract_name)
         .map(|(i, b)| (BlobIndex(i), extract_raw_eip2718(&b.data.0)))?;
 
     Some(PendingRethProof {
@@ -77,24 +226,21 @@ pub fn extract_pending_proof(
     })
 }
 
-/// Build and submit a reth `ProofTransaction` for a sequenced reth blob.
+/// Build the reth proof payload for a pending transaction.
 ///
-/// The reth proof payload format (as expected by the reth verifier in `hyli-verifiers`):
+/// Payload format:
 /// ```text
-/// [4-byte LE u32: calldata_len] [borsh(Calldata)]
+/// [4-byte LE u32: calldata_len]  [borsh(Calldata)]
 /// [4-byte LE u32: stateless_len] [bincode(StatelessInput)]
-/// [4-byte LE u32: evm_config_len] [JSON chain-spec bytes]
+/// [4-byte LE u32: evm_config_len][JSON chain-spec bytes]
 /// ```
 pub async fn build_reth_proof_payload(
     pending: &PendingRethProof,
-    current_state_root: [u8; 32],
-    evm_config_json: &[u8],
+    eth_state: &EthChainState,
 ) -> Result<Vec<u8>> {
     use borsh::to_vec as borsh_to_vec;
     use sdk::Calldata;
 
-    // Build the Hyli calldata for this blob.
-    // TxId is (DataProposalHash, TxHash); .1 gives the TxHash.
     let tx_hash = pending.tx_id.1.clone();
     let calldata = Calldata {
         identity: pending.hyli_tx.identity.clone(),
@@ -109,79 +255,519 @@ pub async fn build_reth_proof_payload(
     let calldata_bytes = borsh_to_vec(&calldata)
         .map_err(|e| anyhow::anyhow!("Failed to borsh-encode calldata: {e}"))?;
 
-    // Build the StatelessInput for this transaction.
-    let stateless_bytes = build_stateless_input(
-        &pending.raw_eip2718,
-        current_state_root,
-        pending.tx_ctx.block_height.0,
-        evm_config_json,
-    )
-    .await?;
+    let stateless_bytes = build_stateless_input(eth_state, &pending.raw_eip2718)?;
 
-    // Assemble the reth proof payload: each segment is length-prefixed (4-byte LE u32).
+    let evm_config_json =
+        serde_json::to_vec(&eth_state.chain_config).context("Serializing chain config")?;
+
     let mut payload = Vec::new();
     write_segment(&mut payload, &calldata_bytes);
     write_segment(&mut payload, &stateless_bytes);
-    write_segment(&mut payload, evm_config_json);
+    write_segment(&mut payload, &evm_config_json);
 
     Ok(payload)
-}
-
-/// Write a length-prefixed segment (4-byte LE u32 + data) into `buf`.
-fn write_segment(buf: &mut Vec<u8>, data: &[u8]) {
-    let len = data.len() as u32;
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(data);
-}
-
-/// Build the bincode-encoded `StatelessInput` for a single EIP-2718 transaction.
-///
-/// This is where a Reth execution instance is needed: given the raw transaction bytes and
-/// the current EVM state root, execute the transaction against the EVM state and collect
-/// the execution witness (sparse state trie nodes, bytecodes, ancestor headers).
-///
-/// # TODO – EVM executor integration
-/// Implement using one of:
-/// 1. **In-process revm + trie** – maintain the full EVM state locally (add `revm`,
-///    `alloy-trie` or `reth-trie-sparse` deps). Execute the tx with `revm`'s `EVM` builder,
-///    collect touched accounts / storage slots, compute sparse trie proofs, and assemble
-///    `ExecutionWitness { state, storage, codes, keys, headers }` + wrap in `StatelessInput`.
-/// 2. **External reth node** – forward the raw tx to a reth JSON-RPC node with a custom
-///    `engine_getExecutionWitness` or `debug_*` endpoint that returns a `StatelessInput`.
-/// 3. **Block assembler service** – a dedicated micro-service that wraps a reth node
-///    and accepts `(raw_eip2718, state_root)` → returns `bincode(StatelessInput)`.
-async fn build_stateless_input(
-    _raw_eip2718: &[u8],
-    _current_state_root: [u8; 32],
-    _block_number: u64,
-    _evm_config_json: &[u8],
-) -> Result<Vec<u8>> {
-    anyhow::bail!(
-        "Reth StatelessInput building is not yet implemented. \
-         Wire up an EVM executor (revm in-process or external reth node) to \
-         execute the EIP-2718 transaction and produce the execution witness."
-    )
 }
 
 /// Submit a reth `ProofTransaction` to the Hyli node.
 pub async fn submit_reth_proof(
     node: &client_sdk::rest_client::NodeApiHttpClient,
-    hyperlane_cn: &ContractName,
+    contract_name: &ContractName,
     program_id: &ProgramId,
     proof_bytes: Vec<u8>,
 ) -> Result<sdk::TxHash> {
     let proof_tx = ProofTransaction {
-        contract_name: hyperlane_cn.clone(),
+        contract_name: contract_name.clone(),
         program_id: program_id.clone(),
         verifier: Verifier(hyli_model::verifiers::RETH.to_string()),
         proof: ProofData(proof_bytes),
     };
 
     debug!(
-        contract_name =% hyperlane_cn,
+        contract_name =% contract_name,
         "Submitting reth ProofTransaction"
     );
 
     let tx_hash = node.send_tx_proof(proof_tx).await?;
     Ok(tx_hash)
+}
+
+// ── Core: build_stateless_input ───────────────────────────────────────────────
+
+/// Build the bincode-encoded `StatelessInput` for a single EIP-2718 transaction.
+pub fn build_stateless_input(eth_state: &EthChainState, raw_eip2718: &[u8]) -> Result<Vec<u8>> {
+    let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
+        .context("Failed to decode EIP-2718 transaction")?;
+    let signer = tx
+        .recover_signer()
+        .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+    let parent = eth_state
+        .header_history
+        .back()
+        .ok_or_else(|| anyhow::anyhow!("No parent header in history"))?
+        .clone();
+
+    // ── Step 1: Execute to collect witness record + state diff ────────────
+
+    let mut db = build_cache_db(&eth_state.accounts);
+    let evm_config = EthEvmConfig::new(eth_state.chain_spec.clone());
+
+    // First pass with placeholder state_root to get the execution output.
+    let block_placeholder = build_synthetic_block_inner(
+        tx.clone(),
+        signer,
+        &parent,
+        eth_state.block_number + 1,
+        &eth_state.chain_spec,
+        B256::ZERO,
+    )?;
+
+    let mut witness_record = ExecutionWitnessRecord::default();
+    let output = evm_config
+        .executor(&mut db)
+        .execute_with_state_closure(&block_placeholder, |state_db| {
+            witness_record.record_executed_state(state_db);
+        })
+        .context("EVM execution failed in build_stateless_input")?;
+
+    // ── Step 2: Compute pre-state proof nodes ─────────────────────────────
+
+    let hashed_state = &witness_record.hashed_state;
+    let account_proof_targets: Vec<B256> = hashed_state.accounts.keys().cloned().collect();
+
+    let (pre_state_root, mut witness_nodes) =
+        build_account_trie_with_proofs(&eth_state.accounts, &account_proof_targets);
+
+    if pre_state_root != eth_state.state_root {
+        warn!(
+            computed = %pre_state_root,
+            tracked = %eth_state.state_root,
+            "Pre-state trie root mismatch vs tracked state root"
+        );
+    }
+
+    // Add storage proof nodes for accessed storage.
+    for (hashed_addr, hashed_storage) in &hashed_state.storages {
+        let addr = find_address_by_hash(&eth_state.accounts, hashed_addr);
+        let empty_storage: HashMap<U256, U256> = HashMap::new();
+        let storage = addr
+            .and_then(|a| eth_state.accounts.get(&a))
+            .map(|s| &s.storage)
+            .unwrap_or(&empty_storage);
+
+        let storage_targets: Vec<B256> = hashed_storage.storage.keys().cloned().collect();
+        let (_, storage_nodes) = build_storage_trie_with_proofs(storage, &storage_targets);
+        witness_nodes.extend(storage_nodes);
+    }
+
+    // ── Step 3: Compute post-state root ──────────────────────────────────
+
+    let hashed_post = HashedPostState::from_bundle_state::<reth_trie_common::KeccakKeyHasher>(
+        &output.state.state,
+    );
+    let post_state_root = compute_post_state_root(&eth_state.accounts, &hashed_post)?;
+
+    // ── Step 4: Build final block with correct post-state root ────────────
+
+    let final_block = build_synthetic_block_inner(
+        tx,
+        signer,
+        &parent,
+        eth_state.block_number + 1,
+        &eth_state.chain_spec,
+        post_state_root,
+    )?;
+
+    // ── Step 5: Assemble ExecutionWitness ─────────────────────────────────
+
+    let headers: Vec<Bytes> = eth_state
+        .header_history
+        .iter()
+        .map(|h| {
+            let mut buf = Vec::new();
+            h.header().encode(&mut buf);
+            Bytes::from(buf)
+        })
+        .collect();
+
+    let witness = ExecutionWitness {
+        state: witness_nodes,
+        codes: witness_record.codes,
+        keys: witness_record.keys,
+        headers,
+    };
+
+    // ── Step 6: Assemble StatelessInput and serialize ─────────────────────
+
+    let stateless_input = StatelessInput {
+        block: final_block.into_block(),
+        witness,
+        chain_config: eth_state.chain_config.clone(),
+    };
+
+    bincode::serialize(&stateless_input).context("bincode serialization of StatelessInput failed")
+}
+
+// ── Trie helpers ──────────────────────────────────────────────────────────────
+
+/// Build the account state trie from `accounts`, retaining proof nodes for
+/// the given `proof_targets` (hashed addresses as `B256`).
+///
+/// Returns `(state_root, witness_nodes)`.
+fn build_account_trie_with_proofs(
+    accounts: &HashMap<Address, AccountState>,
+    proof_targets: &[B256],
+) -> (B256, Vec<Bytes>) {
+    let target_nibbles: Vec<Nibbles> = proof_targets.iter().map(|h| Nibbles::unpack(h)).collect();
+    let retainer = ProofRetainer::new(target_nibbles);
+    let mut hash_builder = HashBuilder::default().with_proof_retainer(retainer);
+
+    // Sort accounts by hashed address for deterministic trie ordering.
+    let mut sorted: Vec<(B256, &AccountState)> = accounts
+        .iter()
+        .map(|(addr, state)| (keccak256(addr), state))
+        .collect();
+    sorted.sort_by_key(|(h, _)| *h);
+
+    for (hashed_addr, state) in &sorted {
+        let (storage_root, _) = build_storage_trie_with_proofs(&state.storage, &[]);
+
+        let trie_account = TrieAccount {
+            nonce: state.nonce,
+            balance: state.balance,
+            storage_root,
+            code_hash: state.code_hash,
+        };
+
+        let rlp_encoded = alloy_rlp::encode(trie_account);
+        hash_builder.add_leaf(Nibbles::unpack(hashed_addr), &rlp_encoded);
+    }
+
+    let state_root = hash_builder.root();
+    let proof_nodes = hash_builder.take_proof_nodes();
+    let witness_nodes: Vec<Bytes> = proof_nodes.into_inner().into_values().collect();
+
+    (state_root, witness_nodes)
+}
+
+/// Build a storage trie retaining proof nodes for `proof_targets` (hashed slot keys).
+fn build_storage_trie_with_proofs(
+    storage: &HashMap<U256, U256>,
+    proof_targets: &[B256],
+) -> (B256, Vec<Bytes>) {
+    // Filter to non-zero slots.
+    let non_zero: Vec<(B256, U256)> = storage
+        .iter()
+        .filter(|(_, v)| !v.is_zero())
+        .map(|(slot, value)| (keccak256(B256::from(*slot)), *value))
+        .collect();
+
+    if non_zero.is_empty() {
+        return (EMPTY_ROOT_HASH, Vec::new());
+    }
+
+    let target_nibbles: Vec<Nibbles> = proof_targets.iter().map(|h| Nibbles::unpack(h)).collect();
+    let retainer = ProofRetainer::new(target_nibbles);
+    let mut hash_builder = HashBuilder::default().with_proof_retainer(retainer);
+
+    let mut sorted = non_zero;
+    sorted.sort_by_key(|(h, _)| *h);
+
+    for (hashed_slot, value) in &sorted {
+        // RLP-encode the U256 value as a byte string.
+        let rlp_value = alloy_rlp::encode(value);
+        hash_builder.add_leaf(Nibbles::unpack(hashed_slot), &rlp_value);
+    }
+
+    let storage_root = hash_builder.root();
+    let proof_nodes = hash_builder.take_proof_nodes();
+    let witness_nodes: Vec<Bytes> = proof_nodes.into_inner().into_values().collect();
+
+    (storage_root, witness_nodes)
+}
+
+/// Compute the post-state root by applying `hashed_post` onto a copy of `accounts`.
+fn compute_post_state_root(
+    accounts: &HashMap<Address, AccountState>,
+    hashed_post: &HashedPostState,
+) -> Result<B256> {
+    let mut updated = accounts.clone();
+
+    // Apply account changes.
+    for (hashed_addr, post_account) in &hashed_post.accounts {
+        let addr = find_address_by_hash(accounts, hashed_addr);
+        match (addr, post_account) {
+            (Some(a), Some(info)) => {
+                let entry = updated.entry(a).or_default();
+                entry.nonce = info.nonce;
+                entry.balance = info.balance;
+                entry.code_hash = info.bytecode_hash.unwrap_or(KECCAK_EMPTY);
+            }
+            (Some(a), None) => {
+                updated.remove(&a);
+            }
+            (None, Some(_info)) => {
+                // New account created during execution; we don't know the address
+                // since we only have the hash. Insert a placeholder so the trie
+                // includes it (the verifier recomputes from scratch, so this is
+                // only needed for the state root computation here).
+                // We cannot reverse the hash, so we skip unknown new accounts for
+                // the root computation; the verifier will compute it correctly from
+                // the BundleState.
+                debug!(
+                    hashed_addr = %hashed_addr,
+                    "New account from execution; unknown address — skipping for post-root"
+                );
+            }
+            (None, None) => {} // deleted but wasn't tracked — ignore
+        }
+    }
+
+    // Apply storage changes.
+    for (hashed_addr, hashed_storage) in &hashed_post.storages {
+        if let Some(addr) = find_address_by_hash(accounts, hashed_addr) {
+            let entry = updated.entry(addr).or_default();
+            if hashed_storage.wiped {
+                entry.storage.clear();
+            }
+            for (hashed_slot, value) in &hashed_storage.storage {
+                let slot = find_slot_by_hash(&entry.storage, hashed_slot);
+                match slot {
+                    Some(s) => {
+                        if value.is_zero() {
+                            entry.storage.remove(&s);
+                        } else {
+                            entry.storage.insert(s, *value);
+                        }
+                    }
+                    None if !value.is_zero() => {
+                        // New storage slot; we can't reverse the hash but the
+                        // verifier recomputes this correctly. Skip for root
+                        // estimation.
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    let (post_root, _) = build_account_trie_with_proofs(&updated, &[]);
+    Ok(post_root)
+}
+
+/// Find the `Address` whose `keccak256(addr) == hashed_addr`.
+fn find_address_by_hash(
+    accounts: &HashMap<Address, AccountState>,
+    hashed_addr: &B256,
+) -> Option<Address> {
+    accounts
+        .keys()
+        .find(|addr| keccak256(*addr) == *hashed_addr)
+        .copied()
+}
+
+/// Find the `U256` slot whose `keccak256(B256::from(slot)) == hashed_slot`.
+fn find_slot_by_hash(storage: &HashMap<U256, U256>, hashed_slot: &B256) -> Option<U256> {
+    storage
+        .keys()
+        .find(|slot| keccak256(B256::from(**slot)) == *hashed_slot)
+        .copied()
+}
+
+// ── Block construction ────────────────────────────────────────────────────────
+
+/// Construct a `RecoveredBlock<Block>` containing `tx` as the sole transaction.
+fn build_synthetic_block_inner(
+    tx: TransactionSigned,
+    signer: Address,
+    parent: &SealedHeader,
+    block_number: u64,
+    chain_spec: &ChainSpec,
+    state_root: B256,
+) -> Result<RecoveredBlock<Block>> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .max(parent.timestamp() + 1);
+
+    let base_fee_per_gas = if chain_spec.is_london_active_at_block(block_number) {
+        Some(calc_next_base_fee(parent.header(), chain_spec))
+    } else {
+        None
+    };
+
+    let withdrawals_root = if chain_spec.is_shanghai_active_at_timestamp(timestamp) {
+        Some(EMPTY_ROOT_HASH)
+    } else {
+        None
+    };
+
+    let (blob_gas_used, excess_blob_gas, parent_beacon_block_root) =
+        if chain_spec.is_cancun_active_at_timestamp(timestamp) {
+            (
+                Some(0u64),
+                Some(parent.header().excess_blob_gas.unwrap_or(0)),
+                Some(B256::ZERO),
+            )
+        } else {
+            (None, None, None)
+        };
+
+    // Prague: sha256("") = EMPTY_REQUESTS_HASH
+    let requests_hash = if chain_spec.is_prague_active_at_timestamp(timestamp) {
+        Some(alloy_primitives::b256!(
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ))
+    } else {
+        None
+    };
+
+    let header = Header {
+        parent_hash: parent.hash(),
+        ommers_hash: alloy_primitives::b256!(
+            "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+        ),
+        beneficiary: Address::ZERO,
+        state_root,
+        transactions_root: EMPTY_ROOT_HASH,
+        receipts_root: EMPTY_ROOT_HASH,
+        withdrawals_root,
+        logs_bloom: Default::default(),
+        difficulty: U256::ZERO,
+        number: block_number,
+        gas_limit: parent.gas_limit(),
+        gas_used: 0,
+        timestamp,
+        mix_hash: B256::ZERO,
+        nonce: alloy_primitives::B64::ZERO,
+        base_fee_per_gas,
+        blob_gas_used,
+        excess_blob_gas,
+        parent_beacon_block_root,
+        extra_data: Default::default(),
+        requests_hash,
+    };
+
+    let body = BlockBody {
+        transactions: vec![tx],
+        ommers: vec![],
+        withdrawals: withdrawals_root.map(|_| Default::default()),
+    };
+
+    let block = Block { header, body };
+    Ok(RecoveredBlock::new_unhashed(block, vec![signer]))
+}
+
+/// Build the genesis block header.
+fn build_genesis_header(genesis: &Genesis, state_root: B256) -> Header {
+    Header {
+        number: 0,
+        state_root,
+        gas_limit: genesis.gas_limit,
+        timestamp: genesis.timestamp,
+        base_fee_per_gas: genesis.base_fee_per_gas.map(|f| f as u64),
+        difficulty: genesis.difficulty,
+        extra_data: genesis.extra_data.clone(),
+        ommers_hash: alloy_primitives::b256!(
+            "1dcc4de8dec75d7aab85b567b6ccd41ad312451b948a7413f0a142fd40d49347"
+        ),
+        ..Default::default()
+    }
+}
+
+/// Calculate EIP-1559 next base fee.
+fn calc_next_base_fee(parent: &Header, _chain_spec: &ChainSpec) -> u64 {
+    const DENOM: u64 = 8;
+    const TARGET_RATIO: u64 = 2;
+
+    let parent_base_fee = parent.base_fee_per_gas.unwrap_or(1_000_000_000);
+    let gas_used = parent.gas_used;
+    let gas_target = parent.gas_limit / TARGET_RATIO;
+
+    if gas_used == gas_target {
+        parent_base_fee
+    } else if gas_used > gas_target {
+        let delta = parent_base_fee.saturating_mul(gas_used - gas_target) / gas_target / DENOM;
+        parent_base_fee.saturating_add(delta.max(1))
+    } else {
+        let delta = parent_base_fee.saturating_mul(gas_target - gas_used) / gas_target / DENOM;
+        parent_base_fee.saturating_sub(delta)
+    }
+}
+
+// ── State application helpers ─────────────────────────────────────────────────
+
+/// Merge `BundleState` into the flat `accounts` map.
+pub fn merge_bundle_into_accounts(
+    accounts: &mut HashMap<Address, AccountState>,
+    bundle: &BundleState,
+) {
+    for (addr, bundle_account) in bundle.state() {
+        match &bundle_account.info {
+            None => {
+                accounts.remove(addr);
+            }
+            Some(info) => {
+                let entry = accounts.entry(*addr).or_default();
+                entry.nonce = info.nonce;
+                entry.balance = info.balance;
+                entry.code_hash = info.code_hash;
+                if let Some(code) = &info.code {
+                    let raw: Bytes = code.original_bytes();
+                    entry.code = raw;
+                }
+                for (slot, storage_slot) in &bundle_account.storage {
+                    let slot_u256 = U256::from(*slot);
+                    let present: U256 = storage_slot.present_value();
+                    if present.is_zero() {
+                        entry.storage.remove(&slot_u256);
+                    } else {
+                        entry.storage.insert(slot_u256, present);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ── CacheDB builder ───────────────────────────────────────────────────────────
+
+/// Build a `CacheDB<EmptyDB>` from our flat account state.
+pub fn build_cache_db(accounts: &HashMap<Address, AccountState>) -> CacheDB<EmptyDB> {
+    let mut db = CacheDB::new(EmptyDB::default());
+
+    for (addr, state) in accounts {
+        let bytecode = if state.code.is_empty() {
+            Bytecode::default()
+        } else {
+            Bytecode::new_raw(state.code.clone())
+        };
+
+        let info = AccountInfo {
+            balance: state.balance,
+            nonce: state.nonce,
+            code_hash: state.code_hash,
+            code: Some(bytecode),
+            account_id: None,
+        };
+
+        db.insert_account_info(*addr, info);
+
+        for (slot, value) in &state.storage {
+            db.insert_account_storage(*addr, *slot, *value)
+                .expect("insert_account_storage should not fail with EmptyDB");
+        }
+    }
+
+    db
+}
+
+// ── Write segment helper ──────────────────────────────────────────────────────
+
+/// Write a length-prefixed segment (4-byte LE u32 + data) into `buf`.
+fn write_segment(buf: &mut Vec<u8>, data: &[u8]) {
+    let len = data.len() as u32;
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(data);
 }

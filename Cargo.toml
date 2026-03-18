@@ -19,6 +19,22 @@ alloy-consensus = { version = "1.1.0", default-features = false }
 alloy-eips = { version = "=1.6.3", default-features = false }
 alloy-primitives = { version = "1.4.1", default-features = false }
 alloy-sol-types = { version = "1.5", default-features = false }
+alloy-genesis = { version = "1.6", default-features = false }
+alloy-trie = { version = "0.9", default-features = false }
+alloy-rlp = { version = "0.3", default-features = false }
+alloy-rpc-types-debug = { version = "1.6", default-features = false }
+
+reth-stateless = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-revm = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8", features = ["witness"] }
+reth-evm-ethereum = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-evm = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-trie = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth", rev = "a92aca2549a751d0fdb0fbda1d9521e4591397c8" }
+revm = { version = "34.0.0", default-features = false, features = ["std"] }
+bincode = "1.3"
 
 k256 = { version = "0.13", default-features = false }
 tokio-util = { version = "0.7", default-features = false }

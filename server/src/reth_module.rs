@@ -30,7 +30,7 @@ module_bus_client! {
     }
 }
 
-pub struct HyperlaneProverCtx {
+pub struct RethModuleCtx {
     pub port: u16,
     pub node_url: String,
     pub hyli_chain_id: u64,
@@ -40,28 +40,29 @@ pub struct HyperlaneProverCtx {
     pub api: Arc<BuildApiContextInner>,
     /// Initial EVM state root for the hyperlane reth contract (32 bytes).
     pub initial_eth_state_root: [u8; 32],
-    /// EVM chain-spec JSON bytes forwarded to the reth proof payload.
-    /// Must match what was used when registering the `hyperlane` contract.
+    /// Genesis JSON for the EVM chain-spec (required).
     pub evm_config_json: Vec<u8>,
 }
 
-pub struct HyperlaneProverModule {
+pub struct RethModule {
     port: u16,
     bus: RpcProxyBusClient,
     node_client: Arc<client_sdk::rest_client::NodeApiHttpClient>,
-    hyperlane_cn: ContractName,
-    hyperlane_program_id: ProgramId,
-    evm_config_json: Vec<u8>,
+    contract_name: ContractName,
+    program_id: ProgramId,
     eth_chain_state: Arc<RwLock<EthChainState>>,
     pending_proofs: PendingProofsMap,
     catching_up: bool,
 }
 
-impl Module for HyperlaneProverModule {
-    type Context = HyperlaneProverCtx;
+impl Module for RethModule {
+    type Context = RethModuleCtx;
 
     async fn build(bus: SharedMessageBus, ctx: Self::Context) -> Result<Self> {
-        let eth_chain_state = Arc::new(RwLock::new(EthChainState::new(ctx.initial_eth_state_root)));
+        let eth_chain_state = Arc::new(RwLock::new(
+            EthChainState::new(ctx.initial_eth_state_root, &ctx.evm_config_json)
+                .context("Initializing EthChainState from genesis JSON")?,
+        ));
 
         let router_ctx = RouterCtx::new(
             ctx.node_url.clone(),
@@ -98,13 +99,12 @@ impl Module for HyperlaneProverModule {
         // (matches `init.rs::derive_program_pubkey` and `reth.rs::derive_program_pubkey`).
         let hyperlane_program_id = derive_program_pubkey(&ctx.bridge_cn);
 
-        Ok(HyperlaneProverModule {
+        Ok(RethModule {
             port: ctx.port,
             bus: RpcProxyBusClient::new_from_bus(bus.new_handle()).await,
             node_client,
-            hyperlane_cn: ctx.hyperlane_cn,
-            hyperlane_program_id,
-            evm_config_json: ctx.evm_config_json,
+            contract_name: ctx.hyperlane_cn,
+            program_id: hyperlane_program_id,
             eth_chain_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: true,
@@ -116,7 +116,7 @@ impl Module for HyperlaneProverModule {
     }
 }
 
-impl HyperlaneProverModule {
+impl RethModule {
     async fn serve(&mut self) -> Result<()> {
         info!(
             "📡  Starting Hyperlane JSON-RPC proxy on port {}",
@@ -143,7 +143,7 @@ impl HyperlaneProverModule {
                 self.handle_settled_tx(contract_tx);
             }
             ContractListenerEvent::BackfillComplete(contract_name) => {
-                if contract_name == self.hyperlane_cn {
+                if contract_name == self.contract_name {
                     info!(
                         contract_name =% contract_name,
                         "Backfill complete for hyperlane reth contract, starting live proving"
@@ -167,7 +167,7 @@ impl HyperlaneProverModule {
             tx_id, tx, tx_ctx, ..
         } = contract_tx;
 
-        let Some(pending) = extract_pending_proof(tx_id.clone(), tx, tx_ctx, &self.hyperlane_cn)
+        let Some(pending) = extract_pending_proof(tx_id.clone(), tx, tx_ctx, &self.contract_name)
         else {
             return Ok(());
         };
@@ -187,8 +187,8 @@ impl HyperlaneProverModule {
         Ok(())
     }
 
-    /// Handle a settled transaction: update the current EVM state root from the
-    /// `ContractChangeData.state_commitment` for the hyperlane contract.
+    /// Handle a settled transaction: update the current EVM state root and apply
+    /// state changes from the `ContractChangeData.state_commitment`.
     fn handle_settled_tx(&mut self, contract_tx: ContractTx) {
         let ContractTx {
             tx_id,
@@ -196,25 +196,43 @@ impl HyperlaneProverModule {
             ..
         } = contract_tx;
 
-        if let Some(change) = contract_changes.get(&self.hyperlane_cn) {
-            let new_root = &change.state_commitment;
-            if new_root.len() == 32 {
-                let mut root = [0u8; 32];
-                root.copy_from_slice(new_root);
+        if let Some(change) = contract_changes.get(&self.contract_name) {
+            let new_root_bytes = &change.state_commitment;
+            if new_root_bytes.len() == 32 {
+                let mut new_root = [0u8; 32];
+                new_root.copy_from_slice(new_root_bytes);
+
+                // Try to re-execute and apply state diff; fall back to root-only update.
+                let raw_eip2718 = self
+                    .pending_proofs
+                    .get(&tx_id)
+                    .map(|p| p.raw_eip2718.clone());
+
                 if let Ok(mut state) = self.eth_chain_state.write() {
-                    state.state_root = root;
-                    state.block_number += 1;
+                    if let Some(raw) = raw_eip2718 {
+                        if let Err(e) = state.apply_transaction(&raw, new_root) {
+                            warn!(
+                                tx_id =% tx_id,
+                                "apply_transaction failed, falling back to root-only update: {e:#}"
+                            );
+                            state.state_root = alloy_primitives::B256::from(new_root);
+                            state.block_number += 1;
+                        }
+                    } else {
+                        state.state_root = alloy_primitives::B256::from(new_root);
+                        state.block_number += 1;
+                    }
                     debug!(
                         tx_id =% tx_id,
                         block_number = state.block_number,
-                        state_root = hex::encode(root),
+                        state_root = hex::encode(new_root),
                         "Updated EVM state root from settled hyperlane tx"
                     );
                 }
             } else {
                 warn!(
                     tx_id =% tx_id,
-                    len = new_root.len(),
+                    len = new_root_bytes.len(),
                     "Unexpected state_commitment length for hyperlane contract (expected 32)"
                 );
             }
@@ -226,20 +244,20 @@ impl HyperlaneProverModule {
 
     /// Attempt to build and submit a reth proof for a pending transaction.
     async fn try_prove(&self, pending: eth_chain_state::PendingRethProof) {
-        let current_state_root = self
+        let eth_state_snapshot = self
             .eth_chain_state
             .read()
-            .map(|s| s.state_root)
-            .unwrap_or([0u8; 32]);
+            .map(|s| s.clone())
+            .unwrap_or_else(|_| panic!("EthChainState lock poisoned"));
 
         let tx_id = pending.tx_id.clone();
 
-        match build_reth_proof_payload(&pending, current_state_root, &self.evm_config_json).await {
+        match build_reth_proof_payload(&pending, &eth_state_snapshot).await {
             Ok(proof_bytes) => {
                 match submit_reth_proof(
                     self.node_client.as_ref(),
-                    &self.hyperlane_cn,
-                    &self.hyperlane_program_id,
+                    &self.contract_name,
+                    &self.program_id,
                     proof_bytes,
                 )
                 .await

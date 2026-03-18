@@ -15,7 +15,7 @@ use hyperlane_bridge::client::tx_executor_handler::TxExecutorHandler as BridgeTx
 use sdk::{api::NodeInfo, ContractName, Identity};
 use server::{
     conf, init,
-    reth_module::{HyperlaneProverCtx, HyperlaneProverModule},
+    reth_module::{RethModule, RethModuleCtx},
 };
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tracing::info;
@@ -75,18 +75,20 @@ async fn actual_main() -> Result<()> {
             .map_err(|_| anyhow::anyhow!("eth_state_root must be exactly 32 bytes"))?
     };
 
-    // Default to an empty chain-spec JSON. Override via `evm_config_json` in the
-    // config file when a real reth executor is wired up
-    // (see `eth_chain_state::build_stateless_input` TODO).
     let evm_config_json = conf
         .evm_config_json
         .as_deref()
-        .unwrap_or("{}")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "evm_config_json is required: provide the Ethereum genesis JSON \
+                 (e.g. path to genesis.json contents) in the server config"
+            )
+        })?
         .as_bytes()
         .to_vec();
 
     handler
-        .build_module::<HyperlaneProverModule>(HyperlaneProverCtx {
+        .build_module::<RethModule>(RethModuleCtx {
             api: api_ctx.clone(),
             port: server_port,
             node_url: conf.node_url.clone(),
