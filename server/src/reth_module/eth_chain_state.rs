@@ -32,6 +32,14 @@ use tracing::{debug, warn};
 
 // ── EthChainState ─────────────────────────────────────────────────────────────
 
+/// Minimal receipt info stored after a transaction settles on Hyli.
+#[derive(Debug, Clone)]
+pub struct EthTxReceipt {
+    pub block_number: u64,
+    pub block_hash: B256,
+    pub success: bool,
+}
+
 /// In-memory per-account EVM state (flat; trie is rebuilt as needed).
 #[derive(Debug, Clone, Default)]
 pub struct AccountState {
@@ -68,6 +76,9 @@ pub struct EthChainState {
     /// Recent ancestor headers for BLOCKHASH opcode support (up to 256).
     /// The *last* element is the most recent (parent) header.
     pub header_history: VecDeque<SealedHeader>,
+    /// Receipts indexed by EVM tx hash (keccak256 of raw EIP-2718 bytes).
+    /// Populated when a transaction settles on Hyli.
+    pub settled_receipts: HashMap<[u8; 32], EthTxReceipt>,
 }
 
 impl EthChainState {
@@ -126,6 +137,7 @@ impl EthChainState {
             chain_config,
             genesis_json: genesis_json.to_vec(),
             header_history,
+            settled_receipts: HashMap::new(),
         })
     }
 
@@ -356,6 +368,28 @@ impl EthChainState {
     /// Returns a clone of the most recent sealed header.
     pub fn latest_header(&self) -> Option<SealedHeader> {
         self.header_history.back().cloned()
+    }
+
+    /// Record a settled receipt keyed by `keccak256(raw_eip2718)`.
+    ///
+    /// Call this after updating `block_number` and `header_history` so that the
+    /// stored block number and block hash reflect the block that included this tx.
+    pub fn record_settled_receipt(&mut self, raw_eip2718: &[u8], success: bool) {
+        let evm_hash: [u8; 32] = *keccak256(raw_eip2718);
+        let block_number = self.block_number;
+        let block_hash = self
+            .header_history
+            .back()
+            .map(|h| h.hash())
+            .unwrap_or_default();
+        self.settled_receipts.insert(
+            evm_hash,
+            EthTxReceipt {
+                block_number,
+                block_hash,
+                success,
+            },
+        );
     }
 
     /// Push a minimal synthetic sealed header after a fallback (non-EVM) state update.

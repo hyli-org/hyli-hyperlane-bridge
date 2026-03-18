@@ -8,6 +8,7 @@ use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpCl
 use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
 use serde_json::{json, Value};
 use std::sync::{Arc, RwLock};
+use tracing::info;
 
 use crate::reth_module::eth_chain_state::EthChainState;
 use crate::reth_module::types::JsonRpcResponse;
@@ -61,7 +62,12 @@ pub fn eth_block_number(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
         .read()
         .map(|s| s.block_number)
         .unwrap_or(0);
-    JsonRpcResponse::ok(id, json!(format!("0x{:x}", block_number)))
+    // Always report one block ahead of the last settled block so that callers
+    // waiting for N confirmations (e.g. ethers.js transaction.wait(1)) see
+    // current_block >= receipt_block + 1 and proceed without a new tx needed.
+    let reported = block_number + 1;
+    info!(block_number, reported, "eth_blockNumber");
+    JsonRpcResponse::ok(id, json!(format!("0x{:x}", reported)))
 }
 
 pub fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
@@ -456,51 +462,59 @@ pub async fn eth_get_transaction_receipt(
         None => return JsonRpcResponse::ok(id, Value::Null),
     };
 
-    let tx_hash = match hex::decode(hash_hex).map(sdk::TxHash) {
-        Ok(h) => h,
-        Err(_) => return JsonRpcResponse::ok(id, Value::Null),
-    };
+    // Check in-memory settled receipts first (indexed by EVM tx hash = keccak256(raw_eip2718)).
+    // The Hyli indexer stores transactions under the Hyli blob tx hash, not the EVM tx hash,
+    // so querying it directly would always return 404.
+    let evm_hash_bytes: Option<[u8; 32]> =
+        hex::decode(hash_hex).ok().and_then(|b| b.try_into().ok());
 
-    match ctx.indexer_client.get_transaction_with_hash(&tx_hash).await {
-        Ok(tx) => {
-            let status = match tx.transaction_status {
-                sdk::api::TransactionStatusDb::Success => "0x1",
-                sdk::api::TransactionStatusDb::Failure => "0x0",
-                _ => {
-                    return JsonRpcResponse::ok(id, Value::Null);
-                }
-            };
+    if let Some(hash_bytes) = evm_hash_bytes {
+        let (receipt, settled_count) = ctx
+            .eth_chain_state
+            .read()
+            .map(|s| {
+                (
+                    s.settled_receipts.get(&hash_bytes).cloned(),
+                    s.settled_receipts.len(),
+                )
+            })
+            .unwrap_or((None, 0));
 
-            let block_number = tx
-                .block_height
-                .map(|h| format!("0x{:x}", h.0))
-                .unwrap_or_default();
-            let block_hash = tx
-                .block_hash
-                .as_ref()
-                .map(|h| format!("0x{h}"))
-                .unwrap_or_else(|| "0x".to_string());
+        info!(
+            tx = hash_hex,
+            settled_receipts = settled_count,
+            found = receipt.is_some(),
+            "eth_getTransactionReceipt"
+        );
 
-            JsonRpcResponse::ok(
+        if let Some(r) = receipt {
+            info!(
+                tx = hash_hex,
+                block_number = r.block_number,
+                success = r.success,
+                "→ returning receipt"
+            );
+            return JsonRpcResponse::ok(
                 id,
                 json!({
                     "transactionHash": format!("0x{hash_hex}"),
                     "transactionIndex": "0x0",
-                    "blockHash": block_hash,
-                    "blockNumber": block_number,
+                    "blockHash": format!("0x{}", hex::encode(r.block_hash)),
+                    "blockNumber": format!("0x{:x}", r.block_number),
                     "from": "0x0000000000000000000000000000000000000000",
                     "to": "0x0000000000000000000000000000000000000001",
                     "cumulativeGasUsed": "0x0",
                     "gasUsed": "0x0",
                     "logs": [],
                     "logsBloom": "0x".to_string() + &"0".repeat(512),
-                    "status": status,
+                    "status": if r.success { "0x1" } else { "0x0" },
                     "type": "0x2",
                 }),
-            )
+            );
         }
-        Err(_) => JsonRpcResponse::ok(id, Value::Null),
     }
+
+    JsonRpcResponse::ok(id, Value::Null)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

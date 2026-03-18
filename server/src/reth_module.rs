@@ -16,7 +16,7 @@ use hyli_modules::{
 use sdk::{ContractName, ProgramId};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use handlers::RouterCtx;
 use types::{JsonRpcRequest, JsonRpcResponse};
@@ -167,16 +167,20 @@ impl RethModule {
             return Ok(());
         };
 
-        debug!(
+        info!(
             tx_id =% tx_id,
+            catching_up = self.catching_up,
             "Sequenced reth tx for hyperlane contract, queueing for proof"
         );
 
-        if self.catching_up {
-            // Buffer until backfill is complete so we don't prove stale state.
-            self.pending_proofs.insert(tx_id, pending);
-        } else {
-            self.try_prove(pending).await;
+        // Always store in pending_proofs so handle_settled_tx can retrieve the raw
+        // EIP-2718 bytes to record the receipt keyed by EVM tx hash.
+        self.pending_proofs.insert(tx_id.clone(), pending);
+
+        if !self.catching_up {
+            if let Some(pending) = self.pending_proofs.get(&tx_id).cloned() {
+                self.try_prove(pending).await;
+            }
         }
 
         Ok(())
@@ -191,6 +195,13 @@ impl RethModule {
             ..
         } = contract_tx;
 
+        info!(
+            tx_id =% tx_id,
+            has_hyperlane_change = contract_changes.contains_key(&self.contract_name),
+            pending_proof_found = self.pending_proofs.contains_key(&tx_id),
+            "handle_settled_tx"
+        );
+
         if let Some(change) = contract_changes.get(&self.contract_name) {
             let new_root_bytes = &change.state_commitment;
             if new_root_bytes.len() == 32 {
@@ -203,9 +214,15 @@ impl RethModule {
                     .get(&tx_id)
                     .map(|p| p.raw_eip2718.clone());
 
+                info!(
+                    tx_id =% tx_id,
+                    has_raw_eip2718 = raw_eip2718.is_some(),
+                    "settled tx: has raw EIP-2718 bytes for receipt recording"
+                );
+
                 if let Ok(mut state) = self.eth_chain_state.write() {
-                    if let Some(raw) = raw_eip2718 {
-                        if let Err(e) = state.apply_transaction(&raw, new_root) {
+                    if let Some(ref raw) = raw_eip2718 {
+                        if let Err(e) = state.apply_transaction(raw, new_root) {
                             warn!(
                                 tx_id =% tx_id,
                                 "apply_transaction failed, falling back to root-only update: {e:#}"
@@ -216,16 +233,29 @@ impl RethModule {
                             // proof has a valid parent header (avoids "invalid ancestor chain").
                             state.push_fallback_header();
                         }
+                        // Record receipt keyed by EVM tx hash so eth_getTransactionReceipt works.
+                        state.record_settled_receipt(raw, true);
+                        info!(
+                            tx_id =% tx_id,
+                            evm_tx_hash = hex::encode(alloy_primitives::keccak256(raw)),
+                            block_number = state.block_number,
+                            "stored receipt in settled_receipts"
+                        );
                     } else {
                         state.state_root = alloy_primitives::B256::from(new_root);
                         state.block_number += 1;
                         state.push_fallback_header();
+                        warn!(
+                            tx_id =% tx_id,
+                            block_number = state.block_number,
+                            "no raw EIP-2718 — receipt NOT stored (eth_getTransactionReceipt will return null)"
+                        );
                     }
-                    debug!(
+                    info!(
                         tx_id =% tx_id,
                         block_number = state.block_number,
                         state_root = hex::encode(new_root),
-                        "Updated EVM state root from settled hyperlane tx"
+                        "✅ Settled hyperlane tx — EVM block_number updated"
                     );
                 }
             } else {
@@ -295,7 +325,7 @@ async fn rpc_handler(
     let id = req.id.clone();
     let params = &req.params;
 
-    debug!(method = %req.method, params = %params, "RPC request");
+    info!(method = %req.method, params = %params, "→ RPC request");
 
     let resp = match req.method.as_str() {
         "eth_blockNumber" => handlers::eth_block_number(&ctx, id),
@@ -318,9 +348,9 @@ async fn rpc_handler(
     };
 
     if let Some(err) = resp.error.as_ref() {
-        warn!(method = %req.method, code = err.code, message = %err.message, "RPC error response");
+        warn!(method = %req.method, code = err.code, message = %err.message, "← RPC error response");
     } else {
-        debug!(method = %req.method, "RPC ok");
+        info!(method = %req.method, "← RPC ok");
     }
 
     Json(resp)
