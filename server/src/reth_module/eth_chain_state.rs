@@ -28,7 +28,7 @@ use sdk::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 // ── EthChainState ─────────────────────────────────────────────────────────────
 
@@ -518,19 +518,19 @@ impl EthChainState {
 
         let parent = self.header_history.back();
         let block_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
-        let basefee = self.gas_price();
         let block_number = self.block_number + 1;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        // eth_call uses zero gas price so balance checks are skipped (same as geth/reth).
         let block_env = BlockEnv {
             number: U256::from(block_number),
             beneficiary: Address::ZERO,
             timestamp: U256::from(timestamp),
             gas_limit: block_gas_limit,
-            basefee,
+            basefee: 0,
             difficulty: U256::ZERO,
             prevrandao: Some(B256::ZERO),
             blob_excess_gas_and_price: Some(BlobExcessGasAndPrice {
@@ -539,11 +539,12 @@ impl EthChainState {
             }),
         };
 
+        // Use EIP-1559 with zero fees so no balance is required (same as geth eth_call).
         let tx_env = TxEnv {
             tx_type: 2,
             caller: from,
             gas_limit: block_gas_limit,
-            gas_price: basefee as u128,
+            gas_price: 0,
             kind: to.map(TxKind::Call).unwrap_or(TxKind::Create),
             value,
             data,
@@ -553,17 +554,30 @@ impl EthChainState {
         };
 
         let mut db = self.build_cache_db();
-        let ctx = Context::mainnet().with_db(&mut db).with_block(block_env);
+        let ctx = Context::mainnet()
+            .modify_cfg_chained(|cfg| {
+                cfg.chain_id = self.chain_id();
+                cfg.tx_chain_id_check = false;
+                // Disable EIP-7825 tx gas limit cap for call simulation.
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
+            })
+            .with_db(&mut db)
+            .with_block(block_env);
         let mut evm = ctx.build_mainnet();
 
         match evm.transact(tx_env) {
             Ok(outcome) => {
                 let success = outcome.result.is_success();
                 let output = outcome.result.into_output().unwrap_or_default();
+                info!(
+                    "execute_call result: success={} output=0x{}",
+                    success,
+                    hex::encode(&output)
+                );
                 (success, output)
             }
             Err(e) => {
-                warn!("execute_call EVM execution failed: {e:?}");
+                warn!("execute_call EVM error (not a revert): {e:?}");
                 (false, Bytes::default())
             }
         }
