@@ -16,6 +16,22 @@ prover_tx_working_window_size = 50
 prover_idle_flush_interval_secs = 2
 
 # EVM chain genesis (empty chain, all hardforks active from block/time 0, chainId matches hyli_chain_id)
+
+# staticMerkleRootMultisigIsmFactory: "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+# staticMessageIdMultisigIsmFactory: "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512"
+# staticAggregationIsmFactory: "0x9fE46736679d2D9a65F0992F2272dE9f3c7fa6e0"
+# staticAggregationHookFactory: "0xCf7Ed3AccA5a467e9e704C703E8D87F634fB0Fc9"
+# domainRoutingIsmFactory: "0xDc64a140Aa3E981100a9becA4E685f962f0cF6C9"
+# incrementalDomainRoutingIsmFactory: "0x5FC8d32690cc91D4c39d9d3abcBD16989F875707"
+# staticMerkleRootWeightedMultisigIsmFactory: "0x0165878A594ca255338adfa4d48449f69242Eb8F"
+# staticMessageIdWeightedMultisigIsmFactory: "0xa513E6E4b8f2a923D98304ec87F64353C4D5C853"
+# proxyAdmin: "0x2279B7A0a67DB372996a5FaB50D91eAA73d2eBe6"
+# mailbox: "0x610178dA211FEF7D417bC0e6FeD39F05609AD788"
+# interchainAccountRouter: "0x0B306BF915C4d645ff596e518fAf3F9669b97016"
+# validatorAnnounce: "0x959922bE3CAee4b8Cd9a407cc3ac1C251C2007B1"
+# testRecipient: "0x9A9f2CCfdE556A7E9Ff0848998Aa4a0CFD8863AE"
+# merkleTreeHook: "0xA51c1fc2f0D1a1b8494Ed1FE312d7C3a78Ed91C0"
+
 evm_config_json = '''
 {
   "alloc": {

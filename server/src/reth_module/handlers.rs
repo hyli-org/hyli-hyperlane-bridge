@@ -71,11 +71,13 @@ pub fn eth_block_number(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
 }
 
 pub fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    // Fall back to the configured chain ID so we never return "0x0" (ethers.js
+    // treats chainId=0 as "no network" and throws NETWORK_ERROR).
     let chain_id = ctx
         .eth_chain_state
         .read()
         .map(|s| s.chain_id())
-        .unwrap_or(0);
+        .unwrap_or(ctx.hyli_chain_id);
     JsonRpcResponse::ok(id, json!(format!("0x{:x}", chain_id)))
 }
 
@@ -84,7 +86,7 @@ pub fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
         .eth_chain_state
         .read()
         .map(|s| s.chain_id())
-        .unwrap_or(0);
+        .unwrap_or(ctx.hyli_chain_id);
     JsonRpcResponse::ok(id, json!(chain_id.to_string()))
 }
 
@@ -501,13 +503,12 @@ pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     // Parse the original genesis JSON and replace its alloc with the current state.
     // This produces a complete valid genesis JSON (config, gasLimit, etc. preserved)
     // that can be pasted directly as evm_config_json in conf_defaults.toml.
-    let mut genesis: serde_json::Value =
-        match serde_json::from_slice(&state.genesis_json) {
-            Ok(v) => v,
-            Err(e) => {
-                return JsonRpcResponse::err(id, -32603, format!("Failed to parse genesis JSON: {e}"))
-            }
-        };
+    let mut genesis: serde_json::Value = match serde_json::from_slice(&state.genesis_json) {
+        Ok(v) => v,
+        Err(e) => {
+            return JsonRpcResponse::err(id, -32603, format!("Failed to parse genesis JSON: {e}"))
+        }
+    };
     let alloc = state.dump_genesis_alloc();
     let n = alloc.as_object().map(|m| m.len()).unwrap_or(0);
     genesis["alloc"] = alloc;

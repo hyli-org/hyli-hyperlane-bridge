@@ -180,38 +180,46 @@ impl RethModule {
         // Live mode ──────────────────────────────────────────────────────────
 
         // 1. Snapshot BEFORE speculative execution (used for rollback).
-        let snapshot = self
-            .eth_chain_state
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| panic!("EthChainState lock poisoned"));
+        let snapshot = match self.eth_chain_state.read() {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                warn!("EthChainState read lock was poisoned — recovering");
+                e.into_inner().clone()
+            }
+        };
         self.state_snapshots.insert(tx_id.clone(), snapshot);
 
         // 2. Prove against the current (pre-speculative) state.
         self.try_prove(pending.clone()).await;
 
         // 3. Advance state speculatively so the next tx's proof uses the correct pre-state.
-        if let Ok(mut state) = self.eth_chain_state.write() {
-            match state.apply_transaction_speculative(&pending.raw_eip2718) {
-                Ok(()) => {
-                    // Record the receipt now while block_number is correct for this tx.
-                    state.record_settled_receipt(&pending.raw_eip2718, true);
-                    info!(
-                        tx_id =% tx_id,
-                        block_number = state.block_number,
-                        "Speculatively applied tx"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        tx_id =% tx_id,
-                        "Speculative apply failed, using fallback header: {e:#}"
-                    );
-                    state.block_number += 1;
-                    state.push_fallback_header();
-                }
+        let mut state = match self.eth_chain_state.write() {
+            Ok(g) => g,
+            Err(e) => {
+                warn!("EthChainState write lock was poisoned — recovering");
+                e.into_inner()
+            }
+        };
+        match state.apply_transaction_speculative(&pending.raw_eip2718) {
+            Ok(()) => {
+                // Record the receipt now while block_number is correct for this tx.
+                state.record_settled_receipt(&pending.raw_eip2718, true);
+                info!(
+                    tx_id =% tx_id,
+                    block_number = state.block_number,
+                    "Speculatively applied tx"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    tx_id =% tx_id,
+                    "Speculative apply failed, using fallback header: {e:#}"
+                );
+                state.block_number += 1;
+                state.push_fallback_header();
             }
         }
+        drop(state);
 
         self.pending_proofs.insert(tx_id, pending);
         Ok(())
@@ -236,27 +244,35 @@ impl RethModule {
                 continue;
             };
 
-            let snapshot = self
-                .eth_chain_state
-                .read()
-                .map(|s| s.clone())
-                .unwrap_or_else(|_| panic!("EthChainState lock poisoned"));
+            let snapshot = match self.eth_chain_state.read() {
+                Ok(s) => s.clone(),
+                Err(e) => {
+                    warn!("EthChainState read lock was poisoned — recovering");
+                    e.into_inner().clone()
+                }
+            };
             self.state_snapshots.insert(tx_id.clone(), snapshot);
 
             self.try_prove(proof.clone()).await;
 
-            if let Ok(mut state) = self.eth_chain_state.write() {
-                match state.apply_transaction_speculative(&proof.raw_eip2718) {
-                    Ok(()) => {
-                        state.record_settled_receipt(&proof.raw_eip2718, true);
-                    }
-                    Err(e) => {
-                        warn!(tx_id =% tx_id, "Post-backfill speculative apply failed: {e:#}");
-                        state.block_number += 1;
-                        state.push_fallback_header();
-                    }
+            let mut state = match self.eth_chain_state.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("EthChainState write lock was poisoned — recovering");
+                    e.into_inner()
+                }
+            };
+            match state.apply_transaction_speculative(&proof.raw_eip2718) {
+                Ok(()) => {
+                    state.record_settled_receipt(&proof.raw_eip2718, true);
+                }
+                Err(e) => {
+                    warn!(tx_id =% tx_id, "Post-backfill speculative apply failed: {e:#}");
+                    state.block_number += 1;
+                    state.push_fallback_header();
                 }
             }
+            drop(state);
         }
     }
 
@@ -321,27 +337,32 @@ impl RethModule {
                 let mut new_root = [0u8; 32];
                 new_root.copy_from_slice(new_root_bytes);
 
-                if let Ok(mut state) = self.eth_chain_state.write() {
-                    if let Some(ref raw) = raw_eip2718 {
-                        if let Err(e) = state.apply_transaction(raw, new_root) {
-                            warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
-                            state.state_root = alloy_primitives::B256::from(new_root);
-                            state.block_number += 1;
-                            state.push_fallback_header();
-                        }
-                        state.record_settled_receipt(raw, true);
-                    } else {
+                let mut state = match self.eth_chain_state.write() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        warn!("EthChainState write lock was poisoned — recovering");
+                        e.into_inner()
+                    }
+                };
+                if let Some(ref raw) = raw_eip2718 {
+                    if let Err(e) = state.apply_transaction(raw, new_root) {
+                        warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
                         state.state_root = alloy_primitives::B256::from(new_root);
                         state.block_number += 1;
                         state.push_fallback_header();
-                        warn!(tx_id =% tx_id, "no raw EIP-2718 — receipt NOT stored");
                     }
-                    info!(
-                        tx_id =% tx_id,
-                        block_number = state.block_number,
-                        "✅ Settled hyperlane tx (catch-up)"
-                    );
+                    state.record_settled_receipt(raw, true);
+                } else {
+                    state.state_root = alloy_primitives::B256::from(new_root);
+                    state.block_number += 1;
+                    state.push_fallback_header();
+                    warn!(tx_id =% tx_id, "no raw EIP-2718 — receipt NOT stored");
                 }
+                info!(
+                    tx_id =% tx_id,
+                    block_number = state.block_number,
+                    "✅ Settled hyperlane tx (catch-up)"
+                );
             } else {
                 warn!(
                     tx_id =% tx_id,
@@ -371,16 +392,21 @@ impl RethModule {
                 new_root.copy_from_slice(new_root_bytes);
                 let canonical = alloy_primitives::B256::from(new_root);
 
-                if let Ok(mut state) = self.eth_chain_state.write() {
-                    if state.state_root != canonical {
-                        warn!(
-                            tx_id =% tx_id,
-                            speculative =% state.state_root,
-                            %canonical,
-                            "Speculative root differs from canonical — correcting"
-                        );
-                        state.state_root = canonical;
+                let mut state = match self.eth_chain_state.write() {
+                    Ok(g) => g,
+                    Err(e) => {
+                        warn!("EthChainState write lock was poisoned — recovering");
+                        e.into_inner()
                     }
+                };
+                if state.state_root != canonical {
+                    warn!(
+                        tx_id =% tx_id,
+                        speculative =% state.state_root,
+                        %canonical,
+                        "Speculative root differs from canonical — correcting"
+                    );
+                    state.state_root = canonical;
                 }
                 info!(tx_id =% tx_id, "✅ Settled hyperlane tx (live)");
             }
@@ -422,7 +448,14 @@ impl RethModule {
         );
 
         // Restore state — also removes stale speculative receipts and headers pushed after this tx.
-        if let Ok(mut state) = self.eth_chain_state.write() {
+        {
+            let mut state = match self.eth_chain_state.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("EthChainState write lock was poisoned — recovering");
+                    e.into_inner()
+                }
+            };
             *state = rollback_state;
         }
 
@@ -437,42 +470,52 @@ impl RethModule {
             };
 
             // Update snapshot — the old one assumed the failed tx had succeeded.
-            let new_snapshot = self
-                .eth_chain_state
-                .read()
-                .map(|s| s.clone())
-                .unwrap_or_else(|_| panic!("EthChainState lock poisoned"));
+            let new_snapshot = match self.eth_chain_state.read() {
+                Ok(s) => s.clone(),
+                Err(e) => {
+                    warn!("EthChainState read lock was poisoned — recovering");
+                    e.into_inner().clone()
+                }
+            };
             self.state_snapshots.insert(sub_id.clone(), new_snapshot);
 
             // Re-prove against the now-correct pre-state.
             self.try_prove(pending.clone()).await;
 
             // Re-advance state speculatively for the next iteration.
-            if let Ok(mut state) = self.eth_chain_state.write() {
-                match state.apply_transaction_speculative(&pending.raw_eip2718) {
-                    Ok(()) => {
-                        state.record_settled_receipt(&pending.raw_eip2718, true);
-                    }
-                    Err(e) => {
-                        warn!(
-                            tx_id =% sub_id,
-                            "Re-speculative apply failed, using fallback: {e:#}"
-                        );
-                        state.block_number += 1;
-                        state.push_fallback_header();
-                    }
+            let mut state = match self.eth_chain_state.write() {
+                Ok(g) => g,
+                Err(e) => {
+                    warn!("EthChainState write lock was poisoned — recovering");
+                    e.into_inner()
+                }
+            };
+            match state.apply_transaction_speculative(&pending.raw_eip2718) {
+                Ok(()) => {
+                    state.record_settled_receipt(&pending.raw_eip2718, true);
+                }
+                Err(e) => {
+                    warn!(
+                        tx_id =% sub_id,
+                        "Re-speculative apply failed, using fallback: {e:#}"
+                    );
+                    state.block_number += 1;
+                    state.push_fallback_header();
                 }
             }
+            drop(state);
         }
     }
 
     /// Attempt to build and submit a reth proof for a pending transaction.
     async fn try_prove(&self, pending: eth_chain_state::PendingRethProof) {
-        let eth_state_snapshot = self
-            .eth_chain_state
-            .read()
-            .map(|s| s.clone())
-            .unwrap_or_else(|_| panic!("EthChainState lock poisoned"));
+        let eth_state_snapshot = match self.eth_chain_state.read() {
+            Ok(s) => s.clone(),
+            Err(e) => {
+                warn!("EthChainState read lock was poisoned — recovering");
+                e.into_inner().clone()
+            }
+        };
 
         let tx_id = pending.tx_id.clone();
 
