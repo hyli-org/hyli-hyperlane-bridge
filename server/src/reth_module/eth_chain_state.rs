@@ -528,7 +528,14 @@ impl EthChainState {
         };
 
         let mut db = self.build_cache_db();
-        let ctx = Context::mainnet().with_db(&mut db).with_block(block_env);
+        let ctx = Context::mainnet()
+            .modify_cfg_chained(|cfg| {
+                cfg.chain_id = self.chain_id();
+                cfg.tx_chain_id_check = false;
+                cfg.tx_gas_limit_cap = Some(u64::MAX);
+            })
+            .with_db(&mut db)
+            .with_block(block_env);
         let mut evm = ctx.build_mainnet();
 
         match evm.transact(tx_env) {

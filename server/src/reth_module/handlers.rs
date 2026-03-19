@@ -261,6 +261,11 @@ pub fn eth_gas_price(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     JsonRpcResponse::ok(id, json!(format!("0x{:x}", gas_price)))
 }
 
+pub fn eth_max_priority_fee_per_gas(_ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    // This chain uses zero priority fees (no mempool competition).
+    JsonRpcResponse::ok(id, json!("0x0"))
+}
+
 // ── eth_getLogs ───────────────────────────────────────────────────────────────
 
 pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
