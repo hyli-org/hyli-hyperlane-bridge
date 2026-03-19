@@ -531,9 +531,7 @@ async fn rpc_handler(
         "eth_call" => handlers::eth_call(&ctx, id, params),
         "eth_sendTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
         "eth_sendRawTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
-        "eth_getTransactionByHash" => {
-            handlers::eth_get_transaction_by_hash(&ctx, id, params)
-        }
+        "eth_getTransactionByHash" => handlers::eth_get_transaction_by_hash(&ctx, id, params),
         "eth_getTransactionReceipt" => {
             handlers::eth_get_transaction_receipt(&ctx, id, params).await
         }
@@ -543,6 +541,7 @@ async fn rpc_handler(
         "eth_getBalance" => handlers::eth_get_balance(&ctx, id, params),
         "eth_getCode" => handlers::eth_get_code(&ctx, id, params),
         "eth_getStorageAt" => handlers::eth_get_storage_at(&ctx, id, params),
+        "debug_dumpGenesis" => handlers::debug_dump_genesis(&ctx, id),
         other => JsonRpcResponse::method_not_found(id, other),
     };
 

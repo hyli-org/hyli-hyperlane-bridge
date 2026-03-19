@@ -449,6 +449,18 @@ fn build_hyperlane_message(
     msg
 }
 
+// ── debug_dumpGenesis ─────────────────────────────────────────────────────────
+
+pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
+    let state = match ctx.eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+    let alloc = state.dump_genesis_alloc();
+    info!(accounts = alloc.as_object().map(|m| m.len()).unwrap_or(0), "debug_dumpGenesis");
+    JsonRpcResponse::ok(id, serde_json::json!({ "alloc": alloc }))
+}
+
 // ── eth_call ──────────────────────────────────────────────────────────────────
 
 pub fn eth_call(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {

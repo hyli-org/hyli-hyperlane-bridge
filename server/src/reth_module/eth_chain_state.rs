@@ -427,6 +427,53 @@ impl EthChainState {
         self.header_history.back().cloned()
     }
 
+    /// Serialize the current account state as a genesis-compatible `alloc` JSON object.
+    ///
+    /// The returned string can be pasted directly into the `"alloc"` field of the
+    /// genesis JSON in `conf_defaults.toml` to pre-deploy all currently-known contracts.
+    pub fn dump_genesis_alloc(&self) -> serde_json::Value {
+        use serde_json::{json, Map, Value};
+
+        let mut alloc: Map<String, Value> = Map::new();
+
+        for (addr, account) in &self.accounts {
+            let mut entry: Map<String, Value> = Map::new();
+
+            entry.insert(
+                "balance".into(),
+                json!(format!("0x{:x}", account.balance)),
+            );
+
+            if account.nonce != 0 {
+                entry.insert("nonce".into(), json!(format!("0x{:x}", account.nonce)));
+            }
+
+            if !account.code.is_empty() {
+                entry.insert(
+                    "code".into(),
+                    json!(format!("0x{}", hex::encode(&account.code))),
+                );
+            }
+
+            if !account.storage.is_empty() {
+                let mut storage: Map<String, Value> = Map::new();
+                for (slot, value) in &account.storage {
+                    let slot_bytes: [u8; 32] = slot.to_be_bytes();
+                    let value_bytes: [u8; 32] = value.to_be_bytes();
+                    storage.insert(
+                        format!("0x{}", hex::encode(slot_bytes)),
+                        json!(format!("0x{}", hex::encode(value_bytes))),
+                    );
+                }
+                entry.insert("storage".into(), Value::Object(storage));
+            }
+
+            alloc.insert(format!("{addr:?}"), Value::Object(entry));
+        }
+
+        Value::Object(alloc)
+    }
+
     /// Estimate the gas needed to execute a call/deployment against the current state.
     ///
     /// Runs the transaction through revm with a gas limit equal to the block gas limit,
