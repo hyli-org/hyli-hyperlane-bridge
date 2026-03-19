@@ -539,6 +539,7 @@ async fn rpc_handler(
         "eth_getTransactionCount" => handlers::eth_get_transaction_count(&ctx, id, params),
         "eth_gasPrice" => handlers::eth_gas_price(&ctx, id),
         "eth_maxPriorityFeePerGas" => handlers::eth_max_priority_fee_per_gas(&ctx, id),
+        "eth_feeHistory" => handlers::eth_fee_history(&ctx, id, params),
         "eth_getBalance" => handlers::eth_get_balance(&ctx, id, params),
         "eth_getCode" => handlers::eth_get_code(&ctx, id, params),
         "eth_getStorageAt" => handlers::eth_get_storage_at(&ctx, id, params),

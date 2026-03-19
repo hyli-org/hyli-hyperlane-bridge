@@ -492,7 +492,10 @@ impl EthChainState {
         use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
         let parent = self.header_history.back();
-        let block_gas_limit = parent.map(|h| h.gas_limit()).unwrap_or(30_000_000);
+        let block_gas_limit = parent
+            .map(|h| h.gas_limit())
+            .filter(|&g| g > 0)
+            .unwrap_or(30_000_000);
         let basefee = self.gas_price();
         let block_number = self.block_number + 1;
         let timestamp = std::time::SystemTime::now()
@@ -514,15 +517,28 @@ impl EthChainState {
             }),
         };
 
+        // If `from` is a contract address, revm rejects it with RejectCallerWithCode.
+        // Use a zero address instead so the simulation can still estimate gas.
+        let effective_from = if self
+            .accounts
+            .get(&from)
+            .map(|a| !a.code.is_empty())
+            .unwrap_or(false)
+        {
+            Address::ZERO
+        } else {
+            from
+        };
+
         let tx_env = TxEnv {
             tx_type: 2,
-            caller: from,
+            caller: effective_from,
             gas_limit: block_gas_limit,
             gas_price: basefee as u128,
             kind: to.map(TxKind::Call).unwrap_or(TxKind::Create),
             value,
             data,
-            nonce: self.account_nonce(&from),
+            nonce: self.account_nonce(&effective_from),
             chain_id: Some(self.chain_id()),
             ..Default::default()
         };

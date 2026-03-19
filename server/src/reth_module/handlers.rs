@@ -266,6 +266,43 @@ pub fn eth_max_priority_fee_per_gas(_ctx: &RouterCtx, id: Value) -> JsonRpcRespo
     JsonRpcResponse::ok(id, json!("0x0"))
 }
 
+pub fn eth_fee_history(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    // eth_feeHistory(blockCount, newestBlock, rewardPercentiles)
+    // ethers.js v5 uses this for EIP-1559 fee estimation.
+    let block_count = params
+        .get(0)
+        .and_then(|v| v.as_str())
+        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(1)
+        .max(1);
+
+    let base_fee = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.gas_price())
+        .unwrap_or(1_000_000_000);
+
+    let base_fee_hex = format!("0x{:x}", base_fee);
+    let base_fees: Vec<String> = (0..=block_count).map(|_| base_fee_hex.clone()).collect();
+    let gas_used_ratios: Vec<f64> = (0..block_count).map(|_| 0.5).collect();
+
+    let oldest_block = ctx
+        .eth_chain_state
+        .read()
+        .map(|s| s.block_number.saturating_sub(block_count))
+        .unwrap_or(0);
+
+    JsonRpcResponse::ok(
+        id,
+        json!({
+            "oldestBlock": format!("0x{:x}", oldest_block),
+            "baseFeePerGas": base_fees,
+            "gasUsedRatio": gas_used_ratios,
+            "reward": []
+        }),
+    )
+}
+
 // ── eth_getLogs ───────────────────────────────────────────────────────────────
 
 pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
@@ -461,9 +498,21 @@ pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
         Ok(s) => s,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
+    // Parse the original genesis JSON and replace its alloc with the current state.
+    // This produces a complete valid genesis JSON (config, gasLimit, etc. preserved)
+    // that can be pasted directly as evm_config_json in conf_defaults.toml.
+    let mut genesis: serde_json::Value =
+        match serde_json::from_slice(&state.genesis_json) {
+            Ok(v) => v,
+            Err(e) => {
+                return JsonRpcResponse::err(id, -32603, format!("Failed to parse genesis JSON: {e}"))
+            }
+        };
     let alloc = state.dump_genesis_alloc();
-    info!(accounts = alloc.as_object().map(|m| m.len()).unwrap_or(0), "debug_dumpGenesis");
-    JsonRpcResponse::ok(id, serde_json::json!({ "alloc": alloc }))
+    let n = alloc.as_object().map(|m| m.len()).unwrap_or(0);
+    genesis["alloc"] = alloc;
+    info!(accounts = n, "debug_dumpGenesis");
+    JsonRpcResponse::ok(id, genesis)
 }
 
 // ── eth_call ──────────────────────────────────────────────────────────────────
