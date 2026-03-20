@@ -6717,6 +6717,7 @@ dependencies = [
  "hyli-turmoil-shims",
  "indexmap 2.13.0",
  "k256",
+ "reqwest 0.12.28",
  "reth-chainspec",
  "reth-ethereum-primitives",
  "reth-evm",

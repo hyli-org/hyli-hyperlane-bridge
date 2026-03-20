@@ -41,6 +41,7 @@ indexmap = "2"
 k256 = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true, features = ["derive", "env"] }
+reqwest = { workspace = true }
 tower-http = { workspace = true, features = ["cors"] }
 
 [dev-dependencies]

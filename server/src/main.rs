@@ -45,6 +45,8 @@ async fn actual_main() -> Result<()> {
     info!("  hyperlane_cn = {}", conf.hyperlane_cn);
     info!("  data_dir     = {}", conf.data_directory);
 
+    check_relayer(&conf.relayer_health_url).await?;
+
     let node_client = Arc::new(
         NodeApiHttpClient::new(conf.node_url.clone()).context("Creating node HTTP client")?,
     );
@@ -154,6 +156,15 @@ async fn actual_main() -> Result<()> {
     _ = handler.start_modules().await;
     handler.exit_process().await?;
 
+    Ok(())
+}
+
+async fn check_relayer(url: &str) -> Result<()> {
+    info!("Checking Hyperlane relayer at {url}...");
+    reqwest::get(url)
+        .await
+        .with_context(|| format!("Hyperlane relayer not reachable at {url}"))?;
+    info!("Hyperlane relayer is up");
     Ok(())
 }
 

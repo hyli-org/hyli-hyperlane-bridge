@@ -36,6 +36,8 @@ pub struct Conf {
     pub data_directory: String,
     /// Skip contract deployment on startup
     pub noinit: bool,
+    /// URL to the Hyperlane relayer health endpoint
+    pub relayer_health_url: String,
 
     /// Genesis JSON for the Hyli-hosted EVM chain. Used to derive the initial state root
     /// for contract registration and to initialise the in-process EVM (EthChainState).

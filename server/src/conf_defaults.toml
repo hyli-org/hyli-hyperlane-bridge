@@ -6,6 +6,7 @@ bridge_cn = "hyperlane-bridge"
 hyperlane_cn = "hyperlane"
 data_directory = "data/bridge-server"
 noinit = false
+relayer_health_url = "http://relayer:9090/metrics"   # if set, server aborts on startup if unreachable
 
 # ContractListener / AutoProver
 indexer_database_url = "postgresql://postgres:postgres@localhost:5432/hyli_indexer"
