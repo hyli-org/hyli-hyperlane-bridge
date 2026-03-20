@@ -46,23 +46,31 @@ pub struct RethModule {
     node_client: Arc<client_sdk::rest_client::NodeApiHttpClient>,
     contract_name: ContractName,
     program_id: ProgramId,
-    eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Settled EVM state: advances only when a transaction is confirmed on Hyli.
+    /// This is the state exposed via RPC so clients never observe speculative changes.
+    settled_eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Genesis state — fallback base for `get_state_of_prev_tx` when no history entry exists.
+    base_state: EthChainState,
     pending_proofs: PendingProofsMap,
     catching_up: bool,
     /// Ordered list of tx IDs that have been sequenced but not yet settled.
     tx_chain: Vec<sdk::TxId>,
-    /// EthChainState snapshot taken just *before* each tx in `tx_chain` was applied
-    /// speculatively.  Used to roll back and replay if a tx fails or times out.
-    state_snapshots: indexmap::IndexMap<sdk::TxId, EthChainState>,
+    /// Post-state (and success flag) recorded *after* each tx in `tx_chain` was speculatively
+    /// applied.  Used to find the correct pre-state for rollback/replay (same pattern as
+    /// `AutoProver::state_history`).
+    state_history: indexmap::IndexMap<sdk::TxId, (EthChainState, bool)>,
 }
 
 impl Module for RethModule {
     type Context = RethModuleCtx;
 
     async fn build(bus: SharedMessageBus, ctx: Self::Context) -> Result<Self> {
-        let eth_chain_state = Arc::new(RwLock::new(
+        let base_state = EthChainState::new(&ctx.evm_config_json)
+            .context("Initializing base EthChainState from genesis JSON")?;
+
+        let settled_eth_chain_state = Arc::new(RwLock::new(
             EthChainState::new(&ctx.evm_config_json)
-                .context("Initializing EthChainState from genesis JSON")?,
+                .context("Initializing settled EthChainState from genesis JSON")?,
         ));
 
         let router_ctx = RouterCtx::new(
@@ -71,7 +79,7 @@ impl Module for RethModule {
             ctx.bridge_cn.clone(),
             ctx.hyperlane_cn.clone(),
             ctx.relayer_identity,
-            Arc::clone(&eth_chain_state),
+            Arc::clone(&settled_eth_chain_state),
         )
         .context("Building RPC proxy router context")?;
 
@@ -106,11 +114,12 @@ impl Module for RethModule {
             node_client,
             contract_name: ctx.hyperlane_cn,
             program_id: hyperlane_program_id,
-            eth_chain_state,
+            settled_eth_chain_state,
+            base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: true,
             tx_chain: Vec::new(),
-            state_snapshots: indexmap::IndexMap::new(),
+            state_history: indexmap::IndexMap::new(),
         })
     }
 
@@ -179,36 +188,20 @@ impl RethModule {
 
         // Live mode ──────────────────────────────────────────────────────────
 
-        // 1. Snapshot BEFORE speculative execution (used for rollback).
-        let snapshot = match self.eth_chain_state.read() {
-            Ok(s) => s.clone(),
-            Err(e) => {
-                warn!("EthChainState read lock was poisoned — recovering");
-                e.into_inner().clone()
-            }
-        };
-        self.state_snapshots.insert(tx_id.clone(), snapshot);
-
-        // 2. Prove against the current (pre-speculative) state.
+        // 1. Prove against the current (pre-speculative) state.
         self.try_prove(pending.clone()).await;
 
-        // 3. Advance state speculatively so the next tx's proof uses the correct pre-state.
-        let mut state = match self.eth_chain_state.write() {
-            Ok(g) => g,
-            Err(e) => {
-                warn!("EthChainState write lock was poisoned — recovering");
-                e.into_inner()
-            }
-        };
-        match state.apply_transaction_speculative(&pending.raw_eip2718) {
+        // 2. Advance state speculatively so the next tx's proof uses the correct pre-state.
+        let mut state = self.get_current_state();
+        let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
             Ok(()) => {
-                // Record the receipt now while block_number is correct for this tx.
                 state.record_settled_receipt(&pending.raw_eip2718, true);
                 info!(
                     tx_id =% tx_id,
                     block_number = state.block_number,
                     "Speculatively applied tx"
                 );
+                true
             }
             Err(e) => {
                 warn!(
@@ -217,9 +210,11 @@ impl RethModule {
                 );
                 state.block_number += 1;
                 state.push_fallback_header();
+                false
             }
-        }
-        drop(state);
+        };
+        // 3. Record post-state in history (mirrors AutoProver::state_history pattern).
+        self.state_history.insert(tx_id.clone(), (state, success));
 
         self.pending_proofs.insert(tx_id, pending);
         Ok(())
@@ -237,42 +232,29 @@ impl RethModule {
         );
         self.catching_up = false;
 
-        // For txs still pending settlement: snapshot → prove → speculative apply.
+        // For txs still pending settlement: prove → speculative apply → record in state_history.
         let pending_ids: Vec<sdk::TxId> = self.pending_proofs.keys().cloned().collect();
         for tx_id in &pending_ids {
             let Some(proof) = self.pending_proofs.get(tx_id).cloned() else {
                 continue;
             };
 
-            let snapshot = match self.eth_chain_state.read() {
-                Ok(s) => s.clone(),
-                Err(e) => {
-                    warn!("EthChainState read lock was poisoned — recovering");
-                    e.into_inner().clone()
-                }
-            };
-            self.state_snapshots.insert(tx_id.clone(), snapshot);
-
             self.try_prove(proof.clone()).await;
 
-            let mut state = match self.eth_chain_state.write() {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!("EthChainState write lock was poisoned — recovering");
-                    e.into_inner()
-                }
-            };
-            match state.apply_transaction_speculative(&proof.raw_eip2718) {
+            let mut state = self.get_current_state();
+            let success = match state.apply_transaction_speculative(&proof.raw_eip2718) {
                 Ok(()) => {
                     state.record_settled_receipt(&proof.raw_eip2718, true);
+                    true
                 }
                 Err(e) => {
                     warn!(tx_id =% tx_id, "Post-backfill speculative apply failed: {e:#}");
                     state.block_number += 1;
                     state.push_fallback_header();
+                    false
                 }
-            }
-            drop(state);
+            };
+            self.state_history.insert(tx_id.clone(), (state, success));
         }
     }
 
@@ -337,13 +319,7 @@ impl RethModule {
                 let mut new_root = [0u8; 32];
                 new_root.copy_from_slice(new_root_bytes);
 
-                let mut state = match self.eth_chain_state.write() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!("EthChainState write lock was poisoned — recovering");
-                        e.into_inner()
-                    }
-                };
+                let mut state = self.get_current_state();
                 if let Some(ref raw) = raw_eip2718 {
                     if let Err(e) = state.apply_transaction(raw, new_root) {
                         warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
@@ -363,6 +339,13 @@ impl RethModule {
                     block_number = state.block_number,
                     "✅ Settled hyperlane tx (catch-up)"
                 );
+                // Insert into state_history so subsequent catch-up txs build on this state.
+                self.state_history.insert(tx_id.clone(), (state.clone(), true));
+                // Mirror the settled state to the RPC-facing settled state.
+                match self.settled_eth_chain_state.write() {
+                    Ok(mut s) => *s = state,
+                    Err(e) => warn!("settled_eth_chain_state write lock poisoned: {:?}", e),
+                }
             } else {
                 warn!(
                     tx_id =% tx_id,
@@ -392,28 +375,52 @@ impl RethModule {
                 new_root.copy_from_slice(new_root_bytes);
                 let canonical = alloy_primitives::B256::from(new_root);
 
-                let mut state = match self.eth_chain_state.write() {
-                    Ok(g) => g,
-                    Err(e) => {
-                        warn!("EthChainState write lock was poisoned — recovering");
-                        e.into_inner()
+                // Advance the settled (RPC-facing) state using the post-state from history,
+                // correcting the state root to the canonical value from Hyli.
+                if let Some((hist_state, _success)) = self.state_history.get_mut(tx_id) {
+                    if hist_state.state_root != canonical {
+                        warn!(
+                            tx_id =% tx_id,
+                            speculative =% hist_state.state_root,
+                            %canonical,
+                            "Speculative root differs from canonical — correcting"
+                        );
+                        hist_state.state_root = canonical;
                     }
-                };
-                if state.state_root != canonical {
-                    warn!(
-                        tx_id =% tx_id,
-                        speculative =% state.state_root,
-                        %canonical,
-                        "Speculative root differs from canonical — correcting"
-                    );
-                    state.state_root = canonical;
+                    let settled = hist_state.clone();
+                    match self.settled_eth_chain_state.write() {
+                        Ok(mut s) => *s = settled,
+                        Err(e) => warn!("settled_eth_chain_state write lock poisoned: {:?}", e),
+                    }
                 }
+
+                // Prune previous tx's history entry (it's no longer needed as a rollback base).
+                // The settled tx becomes the new anchor, mirroring AutoProver::settle_tx_success.
+                let prev_id = self
+                    .tx_chain
+                    .iter()
+                    .position(|id| id == tx_id)
+                    .and_then(|pos| {
+                        if pos > 0 {
+                            self.tx_chain.get(pos - 1)
+                        } else {
+                            None
+                        }
+                    })
+                    .cloned();
+                if let Some(prev) = prev_id {
+                    self.state_history.shift_remove(&prev);
+                }
+
+                // Keep tx_id in tx_chain as an anchor for subsequent rollbacks.
+                if let Some(pos) = self.tx_chain.iter().position(|id| id == tx_id) {
+                    self.tx_chain = self.tx_chain.split_off(pos);
+                }
+
                 info!(tx_id =% tx_id, "✅ Settled hyperlane tx (live)");
             }
         }
 
-        self.tx_chain.retain(|id| id != tx_id);
-        self.state_snapshots.shift_remove(tx_id);
         self.pending_proofs.shift_remove(tx_id);
     }
 
@@ -424,8 +431,33 @@ impl RethModule {
         self.pending_proofs.shift_remove(tx_id);
     }
 
-    /// Roll back `EthChainState` to the snapshot taken before `tx_id` was applied,
+    /// Find the `EthChainState` that existed *before* `tx_id` was applied.
+    ///
+    /// Mirrors `AutoProver::get_state_of_prev_tx`: walks `tx_chain` backwards from `tx_id`'s
+    /// position and returns the most recent entry in `state_history`, falling back to
+    /// `base_state` (genesis) when no prior history exists.
+    fn get_state_of_prev_tx(&self, tx_id: &sdk::TxId) -> EthChainState {
+        let pos = self.tx_chain.iter().position(|id| id == tx_id);
+        let Some(pos) = pos else {
+            warn!(
+                tx_id =% tx_id,
+                "tx not in tx_chain — returning base state"
+            );
+            return self.base_state.clone();
+        };
+        for idx in (0..pos).rev() {
+            let prev = &self.tx_chain[idx];
+            if let Some((state, _)) = self.state_history.get(prev) {
+                return state.clone();
+            }
+        }
+        self.base_state.clone()
+    }
+
+    /// Roll back `EthChainState` to the state before `tx_id` was applied (using `state_history`),
     /// then re-prove every subsequent pending tx against the corrected state.
+    ///
+    /// Mirrors `AutoProver::settle_tx_failed` + `clear_state_history_after_failed`.
     async fn rollback_and_replay(&mut self, tx_id: &sdk::TxId) {
         let Some(pos) = self.tx_chain.iter().position(|id| id == tx_id) else {
             warn!(tx_id =% tx_id, "Failed tx not in tx_chain — skipping rollback");
@@ -433,66 +465,45 @@ impl RethModule {
             return;
         };
 
-        let Some(rollback_state) = self.state_snapshots.shift_remove(tx_id) else {
-            warn!(tx_id =% tx_id, "No snapshot for failed tx — cannot roll back");
-            self.tx_chain.remove(pos);
-            self.pending_proofs.shift_remove(tx_id);
-            return;
-        };
+        // Derive pre-state from history instead of a stored snapshot.
+        let pre_state = self.get_state_of_prev_tx(tx_id);
 
         info!(
             tx_id =% tx_id,
-            rollback_block = rollback_state.block_number,
+            rollback_block = pre_state.block_number,
             subsequent = self.tx_chain.len().saturating_sub(pos + 1),
             "🔄 Rolling back EthChainState and replaying subsequent txs"
         );
 
-        // Restore state — also removes stale speculative receipts and headers pushed after this tx.
-        {
-            let mut state = match self.eth_chain_state.write() {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!("EthChainState write lock was poisoned — recovering");
-                    e.into_inner()
-                }
-            };
-            *state = rollback_state;
-        }
-
+        // Remove the failed tx from history and chain.
+        // No explicit state restore needed: clearing state_history entries back to the anchor
+        // means get_current_state() will return the correct pre-state for replay.
+        self.state_history.shift_remove(tx_id);
         self.tx_chain.remove(pos);
         self.pending_proofs.shift_remove(tx_id);
 
-        // Re-prove and re-apply each subsequent tx in order.
+        // Clear state_history for all subsequent txs — they must be re-executed and re-proved
+        // against the corrected pre-state (mirrors AutoProver::clear_state_history_after_failed).
         let subsequent: Vec<sdk::TxId> = self.tx_chain[pos..].to_vec();
+        for sub_id in &subsequent {
+            self.state_history.shift_remove(sub_id);
+        }
+
+        // Re-prove and re-apply each subsequent tx in order.
         for sub_id in &subsequent {
             let Some(pending) = self.pending_proofs.get(sub_id).cloned() else {
                 continue;
             };
 
-            // Update snapshot — the old one assumed the failed tx had succeeded.
-            let new_snapshot = match self.eth_chain_state.read() {
-                Ok(s) => s.clone(),
-                Err(e) => {
-                    warn!("EthChainState read lock was poisoned — recovering");
-                    e.into_inner().clone()
-                }
-            };
-            self.state_snapshots.insert(sub_id.clone(), new_snapshot);
-
             // Re-prove against the now-correct pre-state.
             self.try_prove(pending.clone()).await;
 
-            // Re-advance state speculatively for the next iteration.
-            let mut state = match self.eth_chain_state.write() {
-                Ok(g) => g,
-                Err(e) => {
-                    warn!("EthChainState write lock was poisoned — recovering");
-                    e.into_inner()
-                }
-            };
-            match state.apply_transaction_speculative(&pending.raw_eip2718) {
+            // Re-advance state speculatively and record new post-state in history.
+            let mut state = self.get_current_state();
+            let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
                 Ok(()) => {
                     state.record_settled_receipt(&pending.raw_eip2718, true);
+                    true
                 }
                 Err(e) => {
                     warn!(
@@ -501,22 +512,29 @@ impl RethModule {
                     );
                     state.block_number += 1;
                     state.push_fallback_header();
+                    false
                 }
-            }
-            drop(state);
+            };
+            self.state_history.insert(sub_id.clone(), (state, success));
         }
     }
 
-    /// Attempt to build and submit a reth proof for a pending transaction.
-    async fn try_prove(&self, pending: eth_chain_state::PendingRethProof) {
-        let eth_state_snapshot = match self.eth_chain_state.read() {
-            Ok(s) => s.clone(),
-            Err(e) => {
-                warn!("EthChainState read lock was poisoned — recovering");
-                e.into_inner().clone()
-            }
-        };
+    /// Returns the current speculative EVM state: the post-state of the latest tx in
+    /// `state_history`, or `base_state` (genesis) if no history exists yet.
+    fn get_current_state(&self) -> EthChainState {
+        self.state_history
+            .values()
+            .next_back()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_else(|| self.base_state.clone())
+    }
 
+    /// Attempt to build and submit a reth proof for a pending transaction.
+    ///
+    /// Proof is built from the current speculative state (latest `state_history` entry),
+    /// which is the correct pre-state for the tx being proved.
+    async fn try_prove(&self, pending: eth_chain_state::PendingRethProof) {
+        let eth_state_snapshot = self.get_current_state();
         let tx_id = pending.tx_id.clone();
 
         match eth_state_snapshot.build_proof_payload(&pending) {
@@ -655,7 +673,8 @@ mod tests {
             hyli_turmoil_shims::init_noop_meter_provider();
         });
 
-        let eth_chain_state = Arc::new(RwLock::new(
+        let base_state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        let settled_eth_chain_state = Arc::new(RwLock::new(
             EthChainState::new(TEST_GENESIS.as_bytes()).unwrap(),
         ));
         let bus = SharedMessageBus::new();
@@ -670,32 +689,31 @@ mod tests {
             node_client,
             contract_name: ContractName("reth".into()),
             program_id: ProgramId(vec![]),
-            eth_chain_state,
+            settled_eth_chain_state,
+            base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: false,
             tx_chain: Vec::new(),
-            state_snapshots: IndexMap::new(),
+            state_history: IndexMap::new(),
         }
     }
 
-    /// Simulate the "snapshot → speculative apply" part of handle_sequenced_tx without
-    /// actually sending a proof (try_prove would fail without a live node).
+    /// Simulate the "prove → speculative apply → record history" part of handle_sequenced_tx
+    /// without actually sending a proof (try_prove would fail without a live node).
     fn sequence_tx(module: &mut RethModule, tx_id: TxId, pending: PendingRethProof) {
         module.tx_chain.push(tx_id.clone());
 
-        let snapshot = module.eth_chain_state.read().map(|s| s.clone()).unwrap();
-        module.state_snapshots.insert(tx_id.clone(), snapshot);
-
-        if let Ok(mut state) = module.eth_chain_state.write() {
-            match state.apply_transaction_speculative(&pending.raw_eip2718) {
-                Ok(()) => {
-                    state.record_settled_receipt(&pending.raw_eip2718, true);
-                }
-                Err(e) => {
-                    state.block_number += 1;
-                    state.push_fallback_header();
-                    panic!("speculative apply failed in test: {e:#}");
-                }
+        let mut state = module.get_current_state();
+        match state.apply_transaction_speculative(&pending.raw_eip2718) {
+            Ok(()) => {
+                state.record_settled_receipt(&pending.raw_eip2718, true);
+                module.state_history.insert(tx_id.clone(), (state, true));
+            }
+            Err(e) => {
+                state.block_number += 1;
+                state.push_fallback_header();
+                module.state_history.insert(tx_id.clone(), (state, false));
+                panic!("speculative apply failed in test: {e:#}");
             }
         }
 
@@ -714,7 +732,7 @@ mod tests {
         sequence_tx(&mut m, id_a.clone(), pending_a);
         sequence_tx(&mut m, id_b.clone(), pending_b);
 
-        assert_eq!(m.eth_chain_state.read().unwrap().block_number, 2);
+        assert_eq!(m.get_current_state().block_number, 2);
         assert_eq!(m.tx_chain.len(), 2);
 
         // B fails — roll back to after A (block_number = 1).
@@ -722,7 +740,7 @@ mod tests {
 
         assert_eq!(m.tx_chain.len(), 1, "only A remains in tx_chain");
         assert!(!m.tx_chain.contains(&id_b));
-        assert_eq!(m.eth_chain_state.read().unwrap().block_number, 1);
+        assert_eq!(m.get_current_state().block_number, 1);
     }
 
     #[tokio::test]
@@ -736,7 +754,7 @@ mod tests {
         sequence_tx(&mut m, id_b.clone(), make_pending(id_b.clone(), 1));
         sequence_tx(&mut m, id_c.clone(), make_pending(id_c.clone(), 2));
 
-        assert_eq!(m.eth_chain_state.read().unwrap().block_number, 3);
+        assert_eq!(m.get_current_state().block_number, 3);
 
         // B fails — A is gone, C must be re-proved (re-applied) against the post-A state.
         m.rollback_and_replay(&id_b).await;
@@ -745,11 +763,11 @@ mod tests {
         assert_eq!(m.tx_chain, vec![id_a.clone(), id_c.clone()]);
 
         // EthChainState should be at block 2 (A + re-applied C).
-        assert_eq!(m.eth_chain_state.read().unwrap().block_number, 2);
+        assert_eq!(m.get_current_state().block_number, 2);
 
-        // C's snapshot must have been updated to the post-A state (block 1).
-        let c_snapshot = m.state_snapshots.get(&id_c).unwrap();
-        assert_eq!(c_snapshot.block_number, 1);
+        // C's post-state (in state_history) must be block 2 (re-applied on top of A).
+        let (c_post, _) = m.state_history.get(&id_c).unwrap();
+        assert_eq!(c_post.block_number, 2);
     }
 
     #[tokio::test]
@@ -765,9 +783,13 @@ mod tests {
 
         // A rolled back → state goes to block 0 (genesis), then B is re-applied.
         assert_eq!(m.tx_chain, vec![id_b.clone()]);
-        assert_eq!(m.eth_chain_state.read().unwrap().block_number, 1);
-        let b_snapshot = m.state_snapshots.get(&id_b).unwrap();
-        assert_eq!(b_snapshot.block_number, 0, "B's snapshot should be genesis");
+        assert_eq!(m.get_current_state().block_number, 1);
+        // B's post-state (re-applied on genesis) should be block 1.
+        let (b_post, _) = m.state_history.get(&id_b).unwrap();
+        assert_eq!(
+            b_post.block_number, 1,
+            "B's post-state should be block 1 after re-apply on genesis"
+        );
     }
 
     #[tokio::test]
@@ -792,22 +814,13 @@ mod tests {
             },
         );
 
-        assert!(m
-            .eth_chain_state
-            .read()
-            .unwrap()
-            .settled_receipts
-            .contains_key(&hash_b));
+        assert!(m.get_current_state().settled_receipts.contains_key(&hash_b));
 
         // B fails — its speculative receipt must be removed via rollback.
         m.rollback_and_replay(&id_b).await;
 
         assert!(
-            !m.eth_chain_state
-                .read()
-                .unwrap()
-                .settled_receipts
-                .contains_key(&hash_b),
+            !m.get_current_state().settled_receipts.contains_key(&hash_b),
             "B's receipt must be removed after rollback"
         );
     }
