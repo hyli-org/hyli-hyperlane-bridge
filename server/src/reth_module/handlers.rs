@@ -314,10 +314,7 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
 
     let latest_block = state.block_number;
     let from_block = parse_block_number(filter.get("fromBlock").and_then(|v| v.as_str()), 0);
-    let to_block = parse_block_number(
-        filter.get("toBlock").and_then(|v| v.as_str()),
-        latest_block,
-    );
+    let to_block = parse_block_number(filter.get("toBlock").and_then(|v| v.as_str()), latest_block);
 
     // Optional address filter (single address or array).
     let address_filter: Option<Vec<Address>> = if let Some(addr_val) = filter.get("address") {
@@ -328,7 +325,11 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
                 .iter()
                 .filter_map(|v| v.as_str().and_then(|s| s.parse().ok()))
                 .collect();
-            if addrs.is_empty() { None } else { Some(addrs) }
+            if addrs.is_empty() {
+                None
+            } else {
+                Some(addrs)
+            }
         } else {
             None
         }
@@ -363,7 +364,11 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
                                 Some(b)
                             })
                             .collect();
-                        if v.is_empty() { None } else { Some(v) }
+                        if v.is_empty() {
+                            None
+                        } else {
+                            Some(v)
+                        }
                     } else {
                         None
                     }
@@ -720,7 +725,6 @@ pub async fn eth_get_transaction_receipt(
 
     JsonRpcResponse::ok(id, Value::Null)
 }
-
 
 /// Parse an Ethereum address from `params[index]`, returning `Address::ZERO` on failure.
 fn parse_address_param(params: &Value, index: usize) -> Address {
