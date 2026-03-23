@@ -181,6 +181,11 @@ impl RethModule {
 
         self.tx_chain.push(tx_id.clone());
 
+        // Index messageId immediately so the frontend can poll before settlement.
+        if let Ok(mut state) = self.settled_eth_chain_state.write() {
+            state.index_process_message_id(&pending.raw_eip2718, hex::encode(&tx_id.1 .0));
+        }
+
         if self.catching_up {
             self.pending_proofs.insert(tx_id, pending);
             return Ok(());
@@ -238,6 +243,11 @@ impl RethModule {
             let Some(proof) = self.pending_proofs.get(tx_id).cloned() else {
                 continue;
             };
+
+            // Index messageId for txs that were buffered during catch-up.
+            if let Ok(mut state) = self.settled_eth_chain_state.write() {
+                state.index_process_message_id(&proof.raw_eip2718, hex::encode(&tx_id.1 .0));
+            }
 
             self.try_prove(proof.clone()).await;
 
@@ -344,7 +354,8 @@ impl RethModule {
                     "✅ Settled hyperlane tx (catch-up)"
                 );
                 // Insert into state_history so subsequent catch-up txs build on this state.
-                self.state_history.insert(tx_id.clone(), (state.clone(), true));
+                self.state_history
+                    .insert(tx_id.clone(), (state.clone(), true));
                 // Mirror the settled state to the RPC-facing settled state.
                 match self.settled_eth_chain_state.write() {
                     Ok(mut s) => *s = state,
@@ -609,6 +620,7 @@ async fn rpc_handler(
         "eth_getCode" => handlers::eth_get_code(&ctx, id, params),
         "eth_getStorageAt" => handlers::eth_get_storage_at(&ctx, id, params),
         "debug_dumpGenesis" => handlers::debug_dump_genesis(&ctx, id),
+        "hyli_getTxByMessageId" => handlers::hyli_get_tx_by_message_id(&ctx, id, params),
         other => JsonRpcResponse::method_not_found(id, other),
     };
 

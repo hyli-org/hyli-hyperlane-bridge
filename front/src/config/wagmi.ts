@@ -6,6 +6,6 @@ export const wagmiConfig = createConfig({
   multiInjectedProviderDiscovery: true,
   transports: {
     [sepolia.id]: http(),
-    [hyli.id]: http('http://localhost:4000/rpc'),
+    [hyli.id]: http(hyli.rpcUrls.default.http[0]),
   },
 })

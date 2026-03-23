@@ -80,6 +80,10 @@ pub struct EthChainState {
     /// Receipts indexed by EVM tx hash (keccak256 of raw EIP-2718 bytes).
     /// Populated when a transaction settles on Hyli.
     pub settled_receipts: HashMap<[u8; 32], EthTxReceipt>,
+    /// Index from Hyperlane `messageId` (keccak256 of message bytes in `process(bytes,bytes)`)
+    /// to the Hyli blob tx hash.  Populated only for relay txs (those with the process selector).
+    /// TODO: Might be worth removing it at settlement time to save memory, since it's only needed for correlating pending proofs with Hyli tx hashes.
+    pub message_id_index: HashMap<[u8; 32], String>,
 }
 
 impl EthChainState {
@@ -139,6 +143,7 @@ impl EthChainState {
             genesis_json: genesis_json.to_vec(),
             header_history,
             settled_receipts: HashMap::new(),
+            message_id_index: HashMap::new(),
         })
     }
 
@@ -664,6 +669,16 @@ impl EthChainState {
         }
     }
 
+    /// Index `messageId → hyli_tx_hash` immediately when a tx is sequenced.
+    ///
+    /// This is called on `SequencedTx` so the frontend can poll for the Hyli tx hash
+    /// without waiting for settlement.
+    pub fn index_process_message_id(&mut self, raw_eip2718: &[u8], hyli_tx_hash: String) {
+        if let Some(message_id) = extract_process_message_id(raw_eip2718) {
+            self.message_id_index.insert(message_id, hyli_tx_hash);
+        }
+    }
+
     /// Record a settled receipt keyed by `keccak256(raw_eip2718)`.
     ///
     /// Call this after updating `block_number` and `header_history` so that the
@@ -1177,6 +1192,55 @@ fn write_segment(buf: &mut Vec<u8>, data: &[u8]) {
     let len = data.len() as u32;
     buf.extend_from_slice(&len.to_le_bytes());
     buf.extend_from_slice(data);
+}
+
+/// Extract the Hyperlane `messageId` from the calldata of a `process(bytes,bytes)` call.
+///
+/// The Hyperlane mailbox relayer calls `process(metadata bytes, message bytes)`.
+/// `messageId = keccak256(message)`.  We recover it by ABI-decoding the calldata:
+///   bytes 0..4   → selector (must equal keccak256("process(bytes,bytes)")[..4])
+///   bytes 4..36  → offset of `metadata` (dynamic bytes, ignored)
+///   bytes 36..68 → offset of `message`  (dynamic bytes)
+///   then at (4 + offset..): 32-byte length, then the message bytes themselves.
+fn extract_process_message_id(raw_eip2718: &[u8]) -> Option<[u8; 32]> {
+    use alloy_consensus::Transaction as _;
+    let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718).ok()?;
+    let input: &[u8] = tx.input();
+
+    if input.len() < 4 {
+        return None;
+    }
+    // keccak256("process(bytes,bytes)")[..4]
+    const PROCESS_SELECTOR: [u8; 4] = [0x7c, 0x39, 0xd1, 0x30];
+    if input[..4] != PROCESS_SELECTOR {
+        return None;
+    }
+
+    // ABI body starts at byte 4.
+    let body = &input[4..];
+    // body[32..64] = offset of `message` param (bytes32 / big-endian usize)
+    if body.len() < 64 {
+        return None;
+    }
+    let msg_offset = usize::try_from(u64::from_be_bytes(body[56..64].try_into().ok()?)).ok()?;
+
+    // At body[msg_offset..] we have: 32-byte length, then message bytes.
+    let len_start = msg_offset;
+    let len_end = len_start.checked_add(32)?;
+    if body.len() < len_end {
+        return None;
+    }
+    let msg_len = usize::try_from(u64::from_be_bytes(
+        body[len_end - 8..len_end].try_into().ok()?,
+    ))
+    .ok()?;
+    let msg_start = len_end;
+    let msg_end = msg_start.checked_add(msg_len)?;
+    if body.len() < msg_end {
+        return None;
+    }
+
+    Some(*keccak256(&body[msg_start..msg_end]))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

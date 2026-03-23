@@ -6,3 +6,5 @@ backend_logs*.txt
 .cargo
 configs
 .next
+hyperlane_db
+front/tsconfig.tsbuildinfo

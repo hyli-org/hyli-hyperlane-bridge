@@ -467,6 +467,37 @@ pub fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
     TxEnvelope::decode_2718(&mut raw_bytes.as_slice()).ok()
 }
 
+// ── hyli_getTxByMessageId ─────────────────────────────────────────────────────
+
+/// Custom method: look up the Hyli blob tx hash for a given Hyperlane `messageId`.
+/// Returns `{"hyliTxHash": "<hex>"}` or `null` if not yet indexed.
+pub fn hyli_get_tx_by_message_id(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let message_id_hex = match params.get(0).and_then(|v| v.as_str()) {
+        Some(s) => s.trim_start_matches("0x"),
+        None => return JsonRpcResponse::err(id, -32602, "Missing messageId param"),
+    };
+
+    let message_id_bytes: [u8; 32] = match hex::decode(message_id_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(b) => b,
+        None => {
+            return JsonRpcResponse::err(id, -32602, "Invalid messageId (expected 32-byte hex)")
+        }
+    };
+
+    let state = match ctx.eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+
+    match state.message_id_index.get(&message_id_bytes) {
+        Some(hyli_tx_hash) => JsonRpcResponse::ok(id, json!({ "hyliTxHash": hyli_tx_hash })),
+        None => JsonRpcResponse::ok(id, Value::Null),
+    }
+}
+
 // ── debug_dumpGenesis ─────────────────────────────────────────────────────────
 
 pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {

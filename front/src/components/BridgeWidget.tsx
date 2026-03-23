@@ -18,7 +18,11 @@ export function BridgeWidget() {
   const [recipient, setRecipient] = useState('')
   const { bridge, reset, status } = useBridge()
 
-  const isBusy = status.type === 'pending' || status.type === 'switching_chain'
+  const isBusy =
+    status.type === 'pending' ||
+    status.type === 'switching_chain' ||
+    status.type === 'confirming' ||
+    status.type === 'relaying'
 
   async function handleBridge() {
     if (!amount || parseFloat(amount) <= 0) return

@@ -14,7 +14,10 @@ export function BridgeButton({ amount, status, onBridge }: BridgeButtonProps) {
   const { isConnected, chainId } = useAccount()
 
   const isLoading =
-    status.type === 'pending' || status.type === 'switching_chain'
+    status.type === 'pending' ||
+    status.type === 'switching_chain' ||
+    status.type === 'confirming' ||
+    status.type === 'relaying'
 
   const isOnSepolia = chainId === SEPOLIA_CHAIN_ID
 
@@ -22,7 +25,9 @@ export function BridgeButton({ amount, status, onBridge }: BridgeButtonProps) {
     if (!isConnected) return 'Connect Wallet'
     if (status.type === 'switching_chain') return 'Switching to Sepolia…'
     if (!isOnSepolia) return 'Switch to Sepolia'
-    if (status.type === 'pending') return 'Bridging…'
+    if (status.type === 'pending') return 'Confirm in wallet…'
+    if (status.type === 'confirming') return 'Confirming on Sepolia…'
+    if (status.type === 'relaying') return 'Relaying to Hyli…'
     if (!amount || parseFloat(amount) <= 0) return 'Enter amount'
     return 'Bridge to Hyli'
   }
