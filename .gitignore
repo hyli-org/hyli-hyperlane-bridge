@@ -5,3 +5,4 @@ backend_logs*.txt
 .claude
 .cargo
 configs
+.next
