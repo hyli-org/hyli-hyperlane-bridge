@@ -1,0 +1,40 @@
+{
+  "relayChains": "hyli,sepolia",
+  "gasPaymentEnforcement": [{ "type": "none" }],
+  "chains": {
+    "hyli": {
+      "name": "hyli",
+      "domainId": 1337,
+      "protocol": "ethereum",
+      "rpcUrls": [{ "http": "http://localhost:9002/rpc" }],
+      "mailbox": "0x0f00856CbD2D29a73d673cDCA101EBfa7083C5C1",
+      "interchainGasPaymaster": "0x5330e9c0c88e2b873a5ad2dc3eb469abc6064c9f",
+      "validatorAnnounce": "0x32A684f289AE559dC66Ba4b19Fa62DdCf184AAEB",
+      "merkleTreeHook": "0xE2c4F00C591Cb6548E02c924240C965A76A3c36e",
+      "blocks": {
+        "reorgPeriod": 0,
+        "confirmations": 1,
+        "estimateBlockTime": 5
+      },
+      "index": {
+        "chunk": 2000
+      }
+    },
+    "sepolia": {
+      "name": "sepolia",
+      "domainId": 11155111,
+      "protocol": "ethereum",
+      "rpcUrls": [{ "http": "https://eth-sepolia.g.alchemy.com/v2/GFFNi3GUIVo0qytbtmTFu" }],
+      "mailbox": "0xfFAEF09B3cd11D9b20d1a19bECca54EEC2884766",
+      "blocks": {
+        "reorgPeriod": 2,
+        "confirmations": 1,
+        "estimateBlockTime": 60
+      },
+      "index": {
+        "chunk": 9,
+        "from": 10505473
+      }
+    }
+  }
+}

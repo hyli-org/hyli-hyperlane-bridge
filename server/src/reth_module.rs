@@ -194,8 +194,8 @@ impl RethModule {
         // 2. Advance state speculatively so the next tx's proof uses the correct pre-state.
         let mut state = self.get_current_state();
         let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
-            Ok(()) => {
-                state.record_settled_receipt(&pending.raw_eip2718, true);
+            Ok(logs) => {
+                state.record_settled_receipt(&pending.raw_eip2718, true, logs);
                 info!(
                     tx_id =% tx_id,
                     block_number = state.block_number,
@@ -243,8 +243,8 @@ impl RethModule {
 
             let mut state = self.get_current_state();
             let success = match state.apply_transaction_speculative(&proof.raw_eip2718) {
-                Ok(()) => {
-                    state.record_settled_receipt(&proof.raw_eip2718, true);
+                Ok(logs) => {
+                    state.record_settled_receipt(&proof.raw_eip2718, true, logs);
                     true
                 }
                 Err(e) => {
@@ -321,13 +321,17 @@ impl RethModule {
 
                 let mut state = self.get_current_state();
                 if let Some(ref raw) = raw_eip2718 {
-                    if let Err(e) = state.apply_transaction(raw, new_root) {
-                        warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
-                        state.state_root = alloy_primitives::B256::from(new_root);
-                        state.block_number += 1;
-                        state.push_fallback_header();
-                    }
-                    state.record_settled_receipt(raw, true);
+                    let logs = match state.apply_transaction(raw, new_root) {
+                        Ok(logs) => logs,
+                        Err(e) => {
+                            warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
+                            state.state_root = alloy_primitives::B256::from(new_root);
+                            state.block_number += 1;
+                            state.push_fallback_header();
+                            vec![]
+                        }
+                    };
+                    state.record_settled_receipt(raw, true, logs);
                 } else {
                     state.state_root = alloy_primitives::B256::from(new_root);
                     state.block_number += 1;
@@ -501,8 +505,8 @@ impl RethModule {
             // Re-advance state speculatively and record new post-state in history.
             let mut state = self.get_current_state();
             let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
-                Ok(()) => {
-                    state.record_settled_receipt(&pending.raw_eip2718, true);
+                Ok(logs) => {
+                    state.record_settled_receipt(&pending.raw_eip2718, true, logs);
                     true
                 }
                 Err(e) => {
@@ -588,7 +592,7 @@ async fn rpc_handler(
         "eth_chainId" => handlers::eth_chain_id(&ctx, id),
         "net_version" => handlers::net_version(&ctx, id),
         "eth_getBlockByNumber" => handlers::eth_get_block_by_number(&ctx, id, params),
-        "eth_getLogs" => handlers::eth_get_logs(&ctx, id, params).await,
+        "eth_getLogs" => handlers::eth_get_logs(&ctx, id, params),
         "eth_call" => handlers::eth_call(&ctx, id, params),
         "eth_sendTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
         "eth_sendRawTransaction" => handlers::eth_send_raw_transaction(&ctx, id, params).await,
@@ -705,8 +709,8 @@ mod tests {
 
         let mut state = module.get_current_state();
         match state.apply_transaction_speculative(&pending.raw_eip2718) {
-            Ok(()) => {
-                state.record_settled_receipt(&pending.raw_eip2718, true);
+            Ok(logs) => {
+                state.record_settled_receipt(&pending.raw_eip2718, true, logs);
                 module.state_history.insert(tx_id.clone(), (state, true));
             }
             Err(e) => {

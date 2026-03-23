@@ -1,8 +1,7 @@
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{keccak256, Address};
-use alloy_sol_types::SolCall;
+use alloy_primitives::Address;
 use anyhow::Result;
 use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
 use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
@@ -12,7 +11,7 @@ use tracing::info;
 
 use crate::reth_module::eth_chain_state::EthChainState;
 use crate::reth_module::types::JsonRpcResponse;
-use hyperlane_bridge::{transferRemoteCall, HyperlaneBridgeAction};
+use hyperlane_bridge::HyperlaneBridgeAction;
 
 #[derive(Clone)]
 pub struct RouterCtx {
@@ -47,11 +46,6 @@ impl RouterCtx {
             eth_chain_state,
         })
     }
-}
-
-// ── Dispatch event topic0 ─────────────────────────────────────────────────────
-fn dispatch_topic0() -> [u8; 32] {
-    *keccak256("Dispatch(address,uint32,bytes32,bytes)")
 }
 
 // ── Block helpers ─────────────────────────────────────────────────────────────
@@ -307,118 +301,141 @@ pub fn eth_fee_history(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
 
 // ── eth_getLogs ───────────────────────────────────────────────────────────────
 
-pub async fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let filter = match params.get(0) {
         Some(f) => f.clone(),
         None => json!({}),
     };
 
+    let state = match ctx.eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+
+    let latest_block = state.block_number;
     let from_block = parse_block_number(filter.get("fromBlock").and_then(|v| v.as_str()), 0);
-    let to_block_tag = filter
-        .get("toBlock")
-        .and_then(|v| v.as_str())
-        .unwrap_or("latest");
+    let to_block = parse_block_number(
+        filter.get("toBlock").and_then(|v| v.as_str()),
+        latest_block,
+    );
 
-    let latest_height = match ctx.indexer_client.get_last_block().await {
-        Ok(b) => b.height,
-        Err(e) => {
-            return JsonRpcResponse::internal_error(id, format!("Failed to get latest block: {e}"))
+    // Optional address filter (single address or array).
+    let address_filter: Option<Vec<Address>> = if let Some(addr_val) = filter.get("address") {
+        if let Some(s) = addr_val.as_str() {
+            s.parse::<Address>().ok().map(|a| vec![a])
+        } else if let Some(arr) = addr_val.as_array() {
+            let addrs: Vec<Address> = arr
+                .iter()
+                .filter_map(|v| v.as_str().and_then(|s| s.parse().ok()))
+                .collect();
+            if addrs.is_empty() { None } else { Some(addrs) }
+        } else {
+            None
         }
+    } else {
+        None
     };
 
-    let to_block = parse_block_number(Some(to_block_tag), latest_height);
+    // Optional topics filter: array of (topic | null | array-of-topics).
+    let topics_filter: Vec<Option<Vec<[u8; 32]>>> = filter
+        .get("topics")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|pos| {
+                    if pos.is_null() {
+                        None
+                    } else if let Some(s) = pos.as_str() {
+                        let h = hex::decode(s.trim_start_matches("0x")).ok()?;
+                        let mut b = [0u8; 32];
+                        let len = h.len().min(32);
+                        b[32 - len..].copy_from_slice(&h[h.len() - len..]);
+                        Some(vec![b])
+                    } else if let Some(options) = pos.as_array() {
+                        let v: Vec<[u8; 32]> = options
+                            .iter()
+                            .filter_map(|o| {
+                                let s = o.as_str()?;
+                                let h = hex::decode(s.trim_start_matches("0x")).ok()?;
+                                let mut b = [0u8; 32];
+                                let len = h.len().min(32);
+                                b[32 - len..].copy_from_slice(&h[h.len() - len..]);
+                                Some(b)
+                            })
+                            .collect();
+                        if v.is_empty() { None } else { Some(v) }
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
-    // Fetch all blob transactions for the hyperlane reth contract.
-    // Each proven reth blob is one EVM transaction on the Hyli-hosted EVM chain.
-    let txs = match ctx
-        .indexer_client
-        .get_blob_transactions_by_contract(&ctx.hyperlane_cn)
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => {
-            return JsonRpcResponse::internal_error(
-                id,
-                format!("Failed to query hyperlane transactions: {e}"),
-            )
+    // Collect and sort receipts by block number for deterministic log ordering.
+    let mut receipts: Vec<(&[u8; 32], _)> = state
+        .settled_receipts
+        .iter()
+        .filter(|(_, r)| r.block_number >= from_block && r.block_number <= to_block)
+        .collect();
+    receipts.sort_by_key(|(_, r)| r.block_number);
+
+    let mut result = Vec::new();
+    let mut global_log_index: usize = 0;
+
+    for (tx_hash, receipt) in receipts {
+        for log in receipt.logs.iter() {
+            // Address filter.
+            if let Some(ref addrs) = address_filter {
+                if !addrs.contains(&log.address) {
+                    global_log_index += 1;
+                    continue;
+                }
+            }
+
+            // Topics filter: each position must match.
+            let mut topic_match = true;
+            for (pos, filter_pos) in topics_filter.iter().enumerate() {
+                if let Some(allowed) = filter_pos {
+                    let log_topic = log.topics().get(pos).map(|t| t.0);
+                    match log_topic {
+                        Some(t) if allowed.contains(&t) => {}
+                        _ => {
+                            topic_match = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            if !topic_match {
+                global_log_index += 1;
+                continue;
+            }
+
+            let topics_json: Vec<String> = log
+                .topics()
+                .iter()
+                .map(|t| format!("0x{}", hex::encode(t.0)))
+                .collect();
+
+            result.push(json!({
+                "address": format!("{:?}", log.address),
+                "topics": topics_json,
+                "data": format!("0x{}", hex::encode(log.data.data.as_ref())),
+                "blockNumber": format!("0x{:x}", receipt.block_number),
+                "transactionHash": format!("0x{}", hex::encode(tx_hash)),
+                "blockHash": format!("0x{}", hex::encode(receipt.block_hash.0)),
+                // Each block contains exactly one transaction (one tx per apply_transaction call).
+                "transactionIndex": "0x0",
+                "logIndex": format!("0x{:x}", global_log_index),
+                "removed": false,
+            }));
+
+            global_log_index += 1;
         }
-    };
-
-    let mut logs = Vec::new();
-    let topic0 = dispatch_topic0();
-
-    for (log_index, tx) in txs.iter().enumerate() {
-        let block_height = tx.block_height.0;
-        if block_height < from_block || block_height > to_block {
-            continue;
-        }
-
-        // Find a reth blob whose EVM transaction calls transferRemote.
-        let transfer_remote_blob = tx.blobs.iter().find(|b| {
-            b.contract_name == ctx.hyperlane_cn.0 && is_transfer_remote_reth_blob(&b.data)
-        });
-
-        let Some(reth_blob) = transfer_remote_blob else {
-            continue;
-        };
-
-        // Parse transferRemote parameters directly from the reth blob.
-        let Some((eth_recipient, amount, destination)) =
-            parse_transfer_remote_from_reth_blob(&reth_blob.data)
-        else {
-            continue;
-        };
-
-        // Build Hyperlane message bytes.
-        let origin = (ctx.hyli_chain_id & 0xFFFF_FFFF) as u32;
-        let nonce = (log_index & 0xFFFF_FFFF) as u32;
-
-        // Sender: bridge contract name as 32-byte right-padded string.
-        let mut sender_bytes = [0u8; 32];
-        let bridge_name = ctx.bridge_cn.0.as_bytes();
-        let copy_len = bridge_name.len().min(32);
-        sender_bytes[32 - copy_len..].copy_from_slice(&bridge_name[..copy_len]);
-
-        let message_bytes = build_hyperlane_message(
-            3, // version
-            nonce,
-            origin,
-            sender_bytes,
-            destination,
-            eth_recipient,
-            amount,
-        );
-
-        let mut sender_topic = [0u8; 32];
-        sender_topic[12..].copy_from_slice(&sender_bytes[20..32]);
-
-        let mut dest_topic = [0u8; 32];
-        dest_topic[28..32].copy_from_slice(&destination.to_be_bytes());
-
-        let msg_id = keccak256(&message_bytes);
-
-        let log = json!({
-            "address": "0x0000000000000000000000000000000000000001",
-            "topics": [
-                format!("0x{}", hex::encode(topic0)),
-                format!("0x{}", hex::encode(sender_topic)),
-                format!("0x{}", hex::encode(dest_topic)),
-                format!("0x{}", hex::encode(eth_recipient)),
-            ],
-            "data": format!("0x{}", hex::encode(&message_bytes)),
-            "blockNumber": format!("0x{:x}", block_height),
-            "transactionHash": format!("0x{}", tx.tx_hash),
-            "transactionIndex": format!("0x{:x}", tx.index),
-            "blockHash": format!("0x{}", tx.block_hash),
-            "logIndex": format!("0x{:x}", log_index),
-            "removed": false,
-            "messageId": format!("0x{}", hex::encode(*msg_id)),
-        });
-
-        logs.push(log);
     }
 
-    JsonRpcResponse::ok(id, json!(logs))
+    JsonRpcResponse::ok(id, json!(result))
 }
 
 /// Parse block number from a hex string tag like "0x1a3" or "latest"/"earliest".
@@ -433,29 +450,6 @@ fn parse_block_number(tag: Option<&str>, latest: u64) -> u64 {
     }
 }
 
-/// Check if a reth blob's EVM transaction calls `WarpRoute.transferRemote`.
-fn is_transfer_remote_reth_blob(data: &[u8]) -> bool {
-    let Some(tx) = decode_blob_as_tx(data) else {
-        return false;
-    };
-    let input = extract_tx_input(&tx);
-    input.len() >= 4 && input.starts_with(&transferRemoteCall::SELECTOR)
-}
-
-/// Extract `(eth_recipient, amount, destination_domain)` from a reth blob whose
-/// EVM transaction calls `WarpRoute.transferRemote`.
-fn parse_transfer_remote_from_reth_blob(data: &[u8]) -> Option<([u8; 32], u128, u32)> {
-    let tx = decode_blob_as_tx(data)?;
-    let input = extract_tx_input(&tx);
-    if input.len() < 4 || !input.starts_with(&transferRemoteCall::SELECTOR) {
-        return None;
-    }
-    let decoded = transferRemoteCall::abi_decode_raw(&input[4..]).ok()?;
-    let amount: u128 = u128::try_from(decoded.amount).ok()?;
-    let recipient: [u8; 32] = decoded.recipient.into();
-    Some((recipient, amount, decoded.destination))
-}
-
 /// Decode a reth blob's raw bytes (stripping any StructuredBlobData wrapper) into a TxEnvelope.
 pub fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
     let raw_bytes = if let Ok(structured) =
@@ -466,31 +460,6 @@ pub fn decode_blob_as_tx(data: &[u8]) -> Option<TxEnvelope> {
         data.to_vec()
     };
     TxEnvelope::decode_2718(&mut raw_bytes.as_slice()).ok()
-}
-
-/// Build a Hyperlane message byte string.
-fn build_hyperlane_message(
-    version: u8,
-    nonce: u32,
-    origin: u32,
-    sender: [u8; 32],
-    destination: u32,
-    recipient: [u8; 32],
-    amount: u128,
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(77 + 64);
-    msg.push(version);
-    msg.extend_from_slice(&nonce.to_be_bytes());
-    msg.extend_from_slice(&origin.to_be_bytes());
-    msg.extend_from_slice(&sender);
-    msg.extend_from_slice(&destination.to_be_bytes());
-    msg.extend_from_slice(&recipient);
-    // Body: token recipient (32 bytes) + amount (32 bytes, big-endian)
-    msg.extend_from_slice(&recipient);
-    let mut amount_bytes = [0u8; 32];
-    amount_bytes[16..].copy_from_slice(&amount.to_be_bytes());
-    msg.extend_from_slice(&amount_bytes);
-    msg
 }
 
 // ── debug_dumpGenesis ─────────────────────────────────────────────────────────
@@ -560,14 +529,20 @@ pub fn eth_call(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
 
+    let selector = if data.len() >= 4 {
+        format!("0x{}", hex::encode(&data[..4]))
+    } else {
+        "none".to_string()
+    };
     let (success, output) = state.execute_call(from, to, data, value);
     let output_hex = format!("0x{}", hex::encode(&output));
 
     info!(
-        "eth_call to={} success={} output_len={}",
+        "eth_call to={} selector={} success={} output={}",
         to.map(|a| format!("{a:?}")).unwrap_or_default(),
+        selector,
         success,
-        output.len()
+        output_hex
     );
 
     if success {
@@ -746,17 +721,6 @@ pub async fn eth_get_transaction_receipt(
     JsonRpcResponse::ok(id, Value::Null)
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-fn extract_tx_input(tx: &TxEnvelope) -> &[u8] {
-    match tx {
-        TxEnvelope::Legacy(t) => t.tx().input.as_ref(),
-        TxEnvelope::Eip2930(t) => t.tx().input.as_ref(),
-        TxEnvelope::Eip1559(t) => t.tx().input.as_ref(),
-        TxEnvelope::Eip7702(t) => t.tx().input.as_ref(),
-        _ => &[],
-    }
-}
 
 /// Parse an Ethereum address from `params[index]`, returning `Address::ZERO` on failure.
 fn parse_address_param(params: &Value, index: usize) -> Address {

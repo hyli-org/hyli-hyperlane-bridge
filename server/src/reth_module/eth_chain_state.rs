@@ -38,6 +38,7 @@ pub struct EthTxReceipt {
     pub block_number: u64,
     pub block_hash: B256,
     pub success: bool,
+    pub logs: Vec<alloy_primitives::Log>,
 }
 
 /// In-memory per-account EVM state (flat; trie is rebuilt as needed).
@@ -148,7 +149,7 @@ impl EthChainState {
         &mut self,
         raw_eip2718: &[u8],
         new_state_root: [u8; 32],
-    ) -> Result<()> {
+    ) -> Result<Vec<alloy_primitives::Log>> {
         let new_root = B256::from(new_state_root);
 
         let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
@@ -173,6 +174,11 @@ impl EthChainState {
             .execute(&exec_block)
             .context("EVM execution failed in apply_transaction")?;
 
+        let logs = output
+            .receipts
+            .first()
+            .map(|r| r.logs.clone())
+            .unwrap_or_default();
         let final_block = finalize_block(exec_block, &output.receipts, output.gas_used, new_root);
 
         self.merge_bundle(&output.state);
@@ -186,7 +192,7 @@ impl EthChainState {
             self.header_history.pop_front();
         }
 
-        Ok(())
+        Ok(logs)
     }
 
     /// Apply a transaction speculatively, computing the post-state root locally.
@@ -195,7 +201,10 @@ impl EthChainState {
     /// from the EVM state diff.  Call this at sequencing time so subsequent proofs are
     /// built against the correct pre-state.  On settlement success the canonical root
     /// from Hyli is used to confirm (or correct) `state_root`.
-    pub fn apply_transaction_speculative(&mut self, raw_eip2718: &[u8]) -> Result<()> {
+    pub fn apply_transaction_speculative(
+        &mut self,
+        raw_eip2718: &[u8],
+    ) -> Result<Vec<alloy_primitives::Log>> {
         let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718)
             .context("Failed to decode EIP-2718 transaction")?;
         let signer = tx
@@ -218,6 +227,11 @@ impl EthChainState {
             .execute(&exec_block)
             .context("EVM execution failed in apply_transaction_speculative")?;
 
+        let logs = output
+            .receipts
+            .first()
+            .map(|r| r.logs.clone())
+            .unwrap_or_default();
         let post_root = compute_post_state_root(&self.accounts, &output.state);
         let final_block = finalize_block(exec_block, &output.receipts, output.gas_used, post_root);
 
@@ -231,7 +245,7 @@ impl EthChainState {
             self.header_history.pop_front();
         }
 
-        Ok(())
+        Ok(logs)
     }
 
     /// Build the reth proof payload for a pending transaction.
@@ -439,10 +453,7 @@ impl EthChainState {
         for (addr, account) in &self.accounts {
             let mut entry: Map<String, Value> = Map::new();
 
-            entry.insert(
-                "balance".into(),
-                json!(format!("0x{:x}", account.balance)),
-            );
+            entry.insert("balance".into(), json!(format!("0x{:x}", account.balance)));
 
             if account.nonce != 0 {
                 entry.insert("nonce".into(), json!(format!("0x{:x}", account.nonce)));
@@ -657,7 +668,12 @@ impl EthChainState {
     ///
     /// Call this after updating `block_number` and `header_history` so that the
     /// stored block number and block hash reflect the block that included this tx.
-    pub fn record_settled_receipt(&mut self, raw_eip2718: &[u8], success: bool) {
+    pub fn record_settled_receipt(
+        &mut self,
+        raw_eip2718: &[u8],
+        success: bool,
+        logs: Vec<alloy_primitives::Log>,
+    ) {
         let evm_hash: [u8; 32] = *keccak256(raw_eip2718);
         let block_number = self.block_number;
         let block_hash = self
@@ -671,6 +687,7 @@ impl EthChainState {
                 block_number,
                 block_hash,
                 success,
+                logs,
             },
         );
     }
@@ -1276,11 +1293,11 @@ pub mod tests {
 
         // Apply A speculatively, snapshot, then apply B.
         state.apply_transaction_speculative(&raw_a).unwrap();
-        state.record_settled_receipt(&raw_a, true);
+        state.record_settled_receipt(&raw_a, true, vec![]);
         let snapshot_before_b = state.clone();
 
         state.apply_transaction_speculative(&raw_b).unwrap();
-        state.record_settled_receipt(&raw_b, true);
+        state.record_settled_receipt(&raw_b, true, vec![]);
 
         assert_eq!(state.block_number, 2);
         let hash_b: [u8; 32] = *alloy_primitives::keccak256(&raw_b);

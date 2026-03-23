@@ -45,7 +45,7 @@ async fn actual_main() -> Result<()> {
     info!("  hyperlane_cn = {}", conf.hyperlane_cn);
     info!("  data_dir     = {}", conf.data_directory);
 
-    check_relayer(&conf.relayer_health_url).await?;
+    check_relayer(&conf.relayer_health_url).await;
 
     let node_client = Arc::new(
         NodeApiHttpClient::new(conf.node_url.clone()).context("Creating node HTTP client")?,
@@ -159,13 +159,21 @@ async fn actual_main() -> Result<()> {
     Ok(())
 }
 
-async fn check_relayer(url: &str) -> Result<()> {
+async fn check_relayer(url: &str) {
     info!("Checking Hyperlane relayer at {url}...");
-    reqwest::get(url)
-        .await
-        .with_context(|| format!("Hyperlane relayer not reachable at {url}"))?;
-    info!("Hyperlane relayer is up");
-    Ok(())
+    match reqwest::get(url).await {
+        Ok(_) => info!("Hyperlane relayer is up"),
+        Err(e) => tracing::warn!(
+            "Hyperlane relayer not reachable at {url}: {e}\n\
+            To start the relayer:\n\
+            \t mkdir -p hyperlane_db && docker run --rm --network host \\\n\
+            \t   -e CONFIG_FILES=/relayer-config.json \\\n\
+            \t   --mount type=bind,source=$(pwd)/relayer-config.json,target=/relayer-config.json,readonly \\\n\
+            \t   --mount type=bind,source=$(pwd)/hyperlane_db,target=/hyperlane_db \\\n\
+            \t   ghcr.io/hyperlane-xyz/hyperlane-agent:agents-v2.1.0 \\\n\
+            \t   ./relayer --db /hyperlane_db --defaultSigner.key <your-key>"
+        ),
+    }
 }
 
 fn parse_relayer_identity(conf: &conf::Conf) -> Identity {
