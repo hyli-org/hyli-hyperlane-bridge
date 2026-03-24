@@ -811,7 +811,9 @@ impl EthChainState {
 #[derive(Debug, Clone)]
 pub struct PendingRethProof {
     pub tx_id: TxId,
-    pub hyli_tx: BlobTransaction,
+    /// Shared with every other `PendingRethProof` extracted from the same Hyli tx so the blob
+    /// data is not duplicated N times when a tx carries multiple reth blobs.
+    pub hyli_tx: Arc<BlobTransaction>,
     pub tx_ctx: Arc<TxContext>,
     /// Index of the reth blob within the transaction blobs.
     pub blob_index: BlobIndex,
@@ -819,8 +821,10 @@ pub struct PendingRethProof {
     pub raw_eip2718: Vec<u8>,
 }
 
-/// Pending proofs indexed by `TxId`.
-pub type PendingProofsMap = IndexMap<TxId, PendingRethProof>;
+/// Pending proofs indexed by `TxId`. Each entry is an ordered list of reth blobs within that
+/// transaction — there may be more than one if the caller packed multiple EVM transactions into
+/// a single Hyli blob transaction.
+pub type PendingProofsMap = IndexMap<TxId, Vec<PendingRethProof>>;
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 
@@ -835,27 +839,32 @@ fn extract_raw_eip2718(data: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Extract the reth blob from a transaction and build a `PendingRethProof`.
-pub fn extract_pending_proof(
+/// Extract all reth blobs from a transaction, in blob-index order.
+///
+/// Returns one `PendingRethProof` per blob whose `contract_name` matches.  The caller must
+/// prove (and speculatively apply) them in the returned order so that each blob uses the correct
+/// pre-state.
+pub fn extract_pending_proofs(
     tx_id: TxId,
     hyli_tx: BlobTransaction,
     tx_ctx: Arc<TxContext>,
     contract_name: &ContractName,
-) -> Option<PendingRethProof> {
-    let (blob_index, raw_eip2718) = hyli_tx
+) -> Vec<PendingRethProof> {
+    // Wrap once so every PendingRethProof in this tx shares the same allocation.
+    let hyli_tx = Arc::new(hyli_tx);
+    hyli_tx
         .blobs
         .iter()
         .enumerate()
-        .find(|(_, b)| b.contract_name == *contract_name)
-        .map(|(i, b)| (BlobIndex(i), extract_raw_eip2718(&b.data.0)))?;
-
-    Some(PendingRethProof {
-        tx_id,
-        hyli_tx,
-        tx_ctx,
-        blob_index,
-        raw_eip2718,
-    })
+        .filter(|(_, b)| b.contract_name == *contract_name)
+        .map(|(i, b)| PendingRethProof {
+            tx_id: tx_id.clone(),
+            hyli_tx: Arc::clone(&hyli_tx),
+            tx_ctx: tx_ctx.clone(),
+            blob_index: BlobIndex(i),
+            raw_eip2718: extract_raw_eip2718(&b.data.0),
+        })
+        .collect()
 }
 
 /// Submit a reth `ProofTransaction` to the Hyli node.

@@ -4,7 +4,7 @@ pub mod types;
 
 use anyhow::{Context, Result};
 use axum::{extract::State, http::Method, routing::post, Json, Router};
-use eth_chain_state::{extract_pending_proof, submit_reth_proof, EthChainState, PendingProofsMap};
+use eth_chain_state::{extract_pending_proofs, submit_reth_proof, EthChainState, PendingProofsMap};
 use hyli_modules::{
     bus::SharedMessageBus,
     module_bus_client, module_handle_messages,
@@ -167,61 +167,74 @@ impl RethModule {
 
     /// Handle a newly sequenced transaction.
     ///
-    /// During catch-up: buffer the proof, add to `tx_chain`.
-    /// In live mode: snapshot → prove → speculative apply → record receipt.
+    /// During catch-up: buffer the proofs, add to `tx_chain`.
+    /// In live mode: for each reth blob in order — snapshot pre-state → prove → speculative apply.
+    /// `state_history[tx_id]` always holds the post-state of the *last* blob so that subsequent
+    /// transactions build on the correct pre-state.
     async fn handle_sequenced_tx(&mut self, contract_tx: ContractTx) -> Result<()> {
         let ContractTx {
             tx_id, tx, tx_ctx, ..
         } = contract_tx;
 
-        let Some(pending) = extract_pending_proof(tx_id.clone(), tx, tx_ctx, &self.contract_name)
-        else {
+        let proofs = extract_pending_proofs(tx_id.clone(), tx, tx_ctx, &self.contract_name);
+        if proofs.is_empty() {
             return Ok(());
-        };
+        }
 
         self.tx_chain.push(tx_id.clone());
 
-        // Index messageId immediately so the frontend can poll before settlement.
+        // Index messageId for every reth blob so the frontend can poll before settlement.
         if let Ok(mut state) = self.settled_eth_chain_state.write() {
-            state.index_process_message_id(&pending.raw_eip2718, hex::encode(&tx_id.1 .0));
+            for p in &proofs {
+                state.index_process_message_id(&p.raw_eip2718, hex::encode(&tx_id.1 .0));
+            }
         }
 
         if self.catching_up {
-            self.pending_proofs.insert(tx_id, pending);
+            self.pending_proofs.insert(tx_id, proofs);
             return Ok(());
         }
 
         // Live mode ──────────────────────────────────────────────────────────
+        //
+        // Prove each blob in order, advancing the speculative state between blobs so that
+        // blob[i+1] is proved against the post-state of blob[i].
+        for pending in &proofs {
+            // 1. Snapshot the current pre-state and submit the proof.
+            let pre_state = self.get_current_state();
+            self.try_prove(pre_state, pending.clone()).await;
 
-        // 1. Prove against the current (pre-speculative) state.
-        self.try_prove(pending.clone()).await;
+            // 2. Advance state speculatively.
+            let mut state = self.get_current_state();
+            let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
+                Ok(logs) => {
+                    state.record_settled_receipt(&pending.raw_eip2718, true, logs);
+                    info!(
+                        tx_id =% tx_id,
+                        blob_index = pending.blob_index.0,
+                        block_number = state.block_number,
+                        "Speculatively applied reth blob"
+                    );
+                    true
+                }
+                Err(e) => {
+                    warn!(
+                        tx_id =% tx_id,
+                        blob_index = pending.blob_index.0,
+                        "Speculative apply failed, using fallback header: {e:#}"
+                    );
+                    state.block_number += 1;
+                    state.push_fallback_header();
+                    false
+                }
+            };
+            // 3. Overwrite state_history[tx_id] with the latest intermediate (or final) state.
+            //    After the loop this entry holds the post-state of the last blob — the correct
+            //    anchor for subsequent transactions and rollback.
+            self.state_history.insert(tx_id.clone(), (state, success));
+        }
 
-        // 2. Advance state speculatively so the next tx's proof uses the correct pre-state.
-        let mut state = self.get_current_state();
-        let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
-            Ok(logs) => {
-                state.record_settled_receipt(&pending.raw_eip2718, true, logs);
-                info!(
-                    tx_id =% tx_id,
-                    block_number = state.block_number,
-                    "Speculatively applied tx"
-                );
-                true
-            }
-            Err(e) => {
-                warn!(
-                    tx_id =% tx_id,
-                    "Speculative apply failed, using fallback header: {e:#}"
-                );
-                state.block_number += 1;
-                state.push_fallback_header();
-                false
-            }
-        };
-        // 3. Record post-state in history (mirrors AutoProver::state_history pattern).
-        self.state_history.insert(tx_id.clone(), (state, success));
-
-        self.pending_proofs.insert(tx_id, pending);
+        self.pending_proofs.insert(tx_id, proofs);
         Ok(())
     }
 
@@ -237,34 +250,43 @@ impl RethModule {
         );
         self.catching_up = false;
 
-        // For txs still pending settlement: prove → speculative apply → record in state_history.
+        // For txs still pending settlement: prove each blob in order → speculative apply → record.
         let pending_ids: Vec<sdk::TxId> = self.pending_proofs.keys().cloned().collect();
         for tx_id in &pending_ids {
-            let Some(proof) = self.pending_proofs.get(tx_id).cloned() else {
+            let Some(proofs) = self.pending_proofs.get(tx_id).cloned() else {
                 continue;
             };
 
-            // Index messageId for txs that were buffered during catch-up.
+            // Index messageId for every blob buffered during catch-up.
             if let Ok(mut state) = self.settled_eth_chain_state.write() {
-                state.index_process_message_id(&proof.raw_eip2718, hex::encode(&tx_id.1 .0));
+                for p in &proofs {
+                    state.index_process_message_id(&p.raw_eip2718, hex::encode(&tx_id.1 .0));
+                }
             }
 
-            self.try_prove(proof.clone()).await;
+            for pending in &proofs {
+                let pre_state = self.get_current_state();
+                self.try_prove(pre_state, pending.clone()).await;
 
-            let mut state = self.get_current_state();
-            let success = match state.apply_transaction_speculative(&proof.raw_eip2718) {
-                Ok(logs) => {
-                    state.record_settled_receipt(&proof.raw_eip2718, true, logs);
-                    true
-                }
-                Err(e) => {
-                    warn!(tx_id =% tx_id, "Post-backfill speculative apply failed: {e:#}");
-                    state.block_number += 1;
-                    state.push_fallback_header();
-                    false
-                }
-            };
-            self.state_history.insert(tx_id.clone(), (state, success));
+                let mut state = self.get_current_state();
+                let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
+                    Ok(logs) => {
+                        state.record_settled_receipt(&pending.raw_eip2718, true, logs);
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            tx_id =% tx_id,
+                            blob_index = pending.blob_index.0,
+                            "Post-backfill speculative apply failed: {e:#}"
+                        );
+                        state.block_number += 1;
+                        state.push_fallback_header();
+                        false
+                    }
+                };
+                self.state_history.insert(tx_id.clone(), (state, success));
+            }
         }
     }
 
@@ -313,40 +335,74 @@ impl RethModule {
     // ── Settlement helpers ────────────────────────────────────────────────────
 
     /// Apply the canonical state for a successfully-settled tx during catch-up.
+    ///
+    /// All reth blobs are applied speculatively in order; the final state root is then overridden
+    /// with the canonical value from Hyli (which is the root after *all* blobs in the tx).
     fn settle_success_catching_up(
         &mut self,
         tx_id: &sdk::TxId,
         contract_changes: &HashMap<ContractName, ContractChangeData>,
     ) {
-        let raw_eip2718 = self
-            .pending_proofs
-            .get(tx_id)
-            .map(|p| p.raw_eip2718.clone());
+        let proofs: Vec<_> = self.pending_proofs.get(tx_id).cloned().unwrap_or_default();
 
         if let Some(change) = contract_changes.get(&self.contract_name) {
             let new_root_bytes = &change.state_commitment;
             if new_root_bytes.len() == 32 {
                 let mut new_root = [0u8; 32];
                 new_root.copy_from_slice(new_root_bytes);
+                let canonical = alloy_primitives::B256::from(new_root);
 
                 let mut state = self.get_current_state();
-                if let Some(ref raw) = raw_eip2718 {
-                    let logs = match state.apply_transaction(raw, new_root) {
-                        Ok(logs) => logs,
-                        Err(e) => {
-                            warn!(tx_id =% tx_id, "apply_transaction failed, using fallback: {e:#}");
-                            state.state_root = alloy_primitives::B256::from(new_root);
-                            state.block_number += 1;
-                            state.push_fallback_header();
-                            vec![]
-                        }
-                    };
-                    state.record_settled_receipt(raw, true, logs);
-                } else {
-                    state.state_root = alloy_primitives::B256::from(new_root);
+                if proofs.is_empty() {
+                    // No reth blobs for this tx — advance state with a fallback header and set root.
+                    state.state_root = canonical;
                     state.block_number += 1;
                     state.push_fallback_header();
                     warn!(tx_id =% tx_id, "no raw EIP-2718 — receipt NOT stored");
+                } else {
+                    // Apply each blob in order.
+                    //
+                    // Intermediate blobs: apply speculatively (no per-blob canonical root).
+                    // Last blob: apply with the canonical root so the sealed header pushed to
+                    //   `header_history` embeds the canonical root — matching the old single-blob
+                    //   behaviour of `apply_transaction(raw, new_root)`.  This keeps
+                    //   `header_history.back().state_root == self.state_root == canonical`
+                    //   as the invariant for subsequent proof building.
+                    let last_idx = proofs.len() - 1;
+                    for (i, pending) in proofs.iter().enumerate() {
+                        let logs = if i < last_idx {
+                            match state.apply_transaction_speculative(&pending.raw_eip2718) {
+                                Ok(logs) => logs,
+                                Err(e) => {
+                                    warn!(
+                                        tx_id =% tx_id,
+                                        blob_index = pending.blob_index.0,
+                                        "apply_transaction (speculative) failed, using fallback: {e:#}"
+                                    );
+                                    state.block_number += 1;
+                                    state.push_fallback_header();
+                                    vec![]
+                                }
+                            }
+                        } else {
+                            // Last blob: seal the header with the canonical root.
+                            match state.apply_transaction(&pending.raw_eip2718, new_root) {
+                                Ok(logs) => logs,
+                                Err(e) => {
+                                    warn!(
+                                        tx_id =% tx_id,
+                                        blob_index = pending.blob_index.0,
+                                        "apply_transaction (canonical) failed, using fallback: {e:#}"
+                                    );
+                                    state.state_root = canonical;
+                                    state.block_number += 1;
+                                    state.push_fallback_header();
+                                    vec![]
+                                }
+                            }
+                        };
+                        state.record_settled_receipt(&pending.raw_eip2718, true, logs);
+                    }
                 }
                 info!(
                     tx_id =% tx_id,
@@ -505,32 +561,40 @@ impl RethModule {
         }
 
         // Re-prove and re-apply each subsequent tx in order.
+        // For txs with multiple reth blobs, iterate through each blob in order so that every
+        // blob is re-proved against the correct intermediate pre-state.
         for sub_id in &subsequent {
-            let Some(pending) = self.pending_proofs.get(sub_id).cloned() else {
+            let Some(proofs) = self.pending_proofs.get(sub_id).cloned() else {
                 continue;
             };
 
-            // Re-prove against the now-correct pre-state.
-            self.try_prove(pending.clone()).await;
+            for pending in &proofs {
+                // Re-prove against the now-correct pre-state.
+                let pre_state = self.get_current_state();
+                self.try_prove(pre_state, pending.clone()).await;
 
-            // Re-advance state speculatively and record new post-state in history.
-            let mut state = self.get_current_state();
-            let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
-                Ok(logs) => {
-                    state.record_settled_receipt(&pending.raw_eip2718, true, logs);
-                    true
-                }
-                Err(e) => {
-                    warn!(
-                        tx_id =% sub_id,
-                        "Re-speculative apply failed, using fallback: {e:#}"
-                    );
-                    state.block_number += 1;
-                    state.push_fallback_header();
-                    false
-                }
-            };
-            self.state_history.insert(sub_id.clone(), (state, success));
+                // Re-advance state speculatively and overwrite state_history[sub_id] with latest.
+                let mut state = self.get_current_state();
+                let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
+                    Ok(logs) => {
+                        state.record_settled_receipt(&pending.raw_eip2718, true, logs);
+                        true
+                    }
+                    Err(e) => {
+                        warn!(
+                            tx_id =% sub_id,
+                            blob_index = pending.blob_index.0,
+                            "Re-speculative apply failed, using fallback: {e:#}"
+                        );
+                        state.block_number += 1;
+                        state.push_fallback_header();
+                        false
+                    }
+                };
+                // sub_id not in state_history (was shift_removed above), so insert appends at the end.
+                // Subsequent blobs update in-place, keeping sub_id as next_back() for the next iteration.
+                self.state_history.insert(sub_id.clone(), (state, success));
+            }
         }
     }
 
@@ -546,13 +610,17 @@ impl RethModule {
 
     /// Attempt to build and submit a reth proof for a pending transaction.
     ///
-    /// Proof is built from the current speculative state (latest `state_history` entry),
-    /// which is the correct pre-state for the tx being proved.
-    async fn try_prove(&self, pending: eth_chain_state::PendingRethProof) {
-        let eth_state_snapshot = self.get_current_state();
+    /// `pre_state` must be the EVM state that existed *before* `pending` is applied — the caller
+    /// is responsible for snapshotting it at the right moment, especially when multiple blobs
+    /// within one Hyli tx are proved sequentially.
+    async fn try_prove(
+        &self,
+        pre_state: EthChainState,
+        pending: eth_chain_state::PendingRethProof,
+    ) {
         let tx_id = pending.tx_id.clone();
 
-        match eth_state_snapshot.build_proof_payload(&pending) {
+        match pre_state.build_proof_payload(&pending) {
             Ok(proof_bytes) => {
                 match submit_reth_proof(
                     self.node_client.as_ref(),
@@ -660,22 +728,35 @@ fn derive_program_pubkey(contract_name: &ContractName) -> ProgramId {
 mod tests {
     use super::*;
     use crate::reth_module::eth_chain_state::tests::{make_signed_transfer, TEST_GENESIS};
-    use eth_chain_state::PendingRethProof;
+    use sdk::BlobData;
     use sdk::{BlobTransaction, Identity, TxId};
-    use std::sync::Arc;
+    use std::sync::Arc; // used indirectly via sdk::BlobData in make_contract_tx
 
     fn make_tx_id(n: u8) -> TxId {
         TxId(sdk::DataProposalHash(vec![n; 32]), sdk::TxHash(vec![n; 32]))
     }
 
-    fn make_pending(tx_id: TxId, nonce: u64) -> PendingRethProof {
-        let raw = make_signed_transfer(nonce);
-        PendingRethProof {
-            tx_id: tx_id.clone(),
-            hyli_tx: BlobTransaction::new(Identity("test".into()), vec![]),
+    /// Build a `ContractTx` carrying one reth blob per entry in `raws`.
+    ///
+    /// Calling `m.handle_sequenced_tx(make_contract_tx(...)).await.unwrap()` goes through the
+    /// exact same production path — `extract_pending_proofs`, `try_prove`, speculative apply —
+    /// so tests track any future changes to that logic automatically.
+    /// `try_prove` will fail to reach the node but logs the error and returns; the speculative
+    /// apply still runs, which is all the tests need.
+    fn make_contract_tx(tx_id: TxId, raws: &[Vec<u8>], contract_name: &ContractName) -> ContractTx {
+        let blobs = raws
+            .iter()
+            .map(|raw| sdk::Blob {
+                contract_name: contract_name.clone(),
+                data: BlobData(raw.clone()),
+            })
+            .collect();
+        ContractTx {
+            tx_id,
+            tx: BlobTransaction::new(Identity("test".into()), blobs),
             tx_ctx: Arc::new(sdk::TxContext::default()),
-            blob_index: sdk::BlobIndex(0),
-            raw_eip2718: raw,
+            status: sdk::api::TransactionStatusDb::Success,
+            contract_changes: HashMap::new(),
         }
     }
 
@@ -714,39 +795,27 @@ mod tests {
         }
     }
 
-    /// Simulate the "prove → speculative apply → record history" part of handle_sequenced_tx
-    /// without actually sending a proof (try_prove would fail without a live node).
-    fn sequence_tx(module: &mut RethModule, tx_id: TxId, pending: PendingRethProof) {
-        module.tx_chain.push(tx_id.clone());
-
-        let mut state = module.get_current_state();
-        match state.apply_transaction_speculative(&pending.raw_eip2718) {
-            Ok(logs) => {
-                state.record_settled_receipt(&pending.raw_eip2718, true, logs);
-                module.state_history.insert(tx_id.clone(), (state, true));
-            }
-            Err(e) => {
-                state.block_number += 1;
-                state.push_fallback_header();
-                module.state_history.insert(tx_id.clone(), (state, false));
-                panic!("speculative apply failed in test: {e:#}");
-            }
-        }
-
-        module.pending_proofs.insert(tx_id, pending);
-    }
-
     #[tokio::test]
     async fn rollback_restores_state_before_failed_tx() {
         let mut m = make_module().await;
+        let cn = m.contract_name.clone();
 
         let id_a = make_tx_id(1);
         let id_b = make_tx_id(2);
-        let pending_a = make_pending(id_a.clone(), 0);
-        let pending_b = make_pending(id_b.clone(), 1);
-
-        sequence_tx(&mut m, id_a.clone(), pending_a);
-        sequence_tx(&mut m, id_b.clone(), pending_b);
+        m.handle_sequenced_tx(make_contract_tx(
+            id_a.clone(),
+            &[make_signed_transfer(0)],
+            &cn,
+        ))
+        .await
+        .unwrap();
+        m.handle_sequenced_tx(make_contract_tx(
+            id_b.clone(),
+            &[make_signed_transfer(1)],
+            &cn,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(m.get_current_state().block_number, 2);
         assert_eq!(m.tx_chain.len(), 2);
@@ -762,13 +831,32 @@ mod tests {
     #[tokio::test]
     async fn rollback_middle_tx_replays_subsequent() {
         let mut m = make_module().await;
+        let cn = m.contract_name.clone();
 
         let id_a = make_tx_id(1);
         let id_b = make_tx_id(2);
         let id_c = make_tx_id(3);
-        sequence_tx(&mut m, id_a.clone(), make_pending(id_a.clone(), 0));
-        sequence_tx(&mut m, id_b.clone(), make_pending(id_b.clone(), 1));
-        sequence_tx(&mut m, id_c.clone(), make_pending(id_c.clone(), 2));
+        m.handle_sequenced_tx(make_contract_tx(
+            id_a.clone(),
+            &[make_signed_transfer(0)],
+            &cn,
+        ))
+        .await
+        .unwrap();
+        m.handle_sequenced_tx(make_contract_tx(
+            id_b.clone(),
+            &[make_signed_transfer(1)],
+            &cn,
+        ))
+        .await
+        .unwrap();
+        m.handle_sequenced_tx(make_contract_tx(
+            id_c.clone(),
+            &[make_signed_transfer(2)],
+            &cn,
+        ))
+        .await
+        .unwrap();
 
         assert_eq!(m.get_current_state().block_number, 3);
 
@@ -789,11 +877,24 @@ mod tests {
     #[tokio::test]
     async fn rollback_first_tx_resets_to_genesis() {
         let mut m = make_module().await;
+        let cn = m.contract_name.clone();
 
         let id_a = make_tx_id(1);
         let id_b = make_tx_id(2);
-        sequence_tx(&mut m, id_a.clone(), make_pending(id_a.clone(), 0));
-        sequence_tx(&mut m, id_b.clone(), make_pending(id_b.clone(), 1));
+        m.handle_sequenced_tx(make_contract_tx(
+            id_a.clone(),
+            &[make_signed_transfer(0)],
+            &cn,
+        ))
+        .await
+        .unwrap();
+        m.handle_sequenced_tx(make_contract_tx(
+            id_b.clone(),
+            &[make_signed_transfer(1)],
+            &cn,
+        ))
+        .await
+        .unwrap();
 
         m.rollback_and_replay(&id_a).await;
 
@@ -811,24 +912,23 @@ mod tests {
     #[tokio::test]
     async fn rollback_removes_stale_receipt() {
         let mut m = make_module().await;
+        let cn = m.contract_name.clone();
 
         let id_a = make_tx_id(1);
         let id_b = make_tx_id(2);
         let raw_b = make_signed_transfer(1);
         let hash_b: [u8; 32] = *alloy_primitives::keccak256(&raw_b);
 
-        sequence_tx(&mut m, id_a.clone(), make_pending(id_a.clone(), 0));
-        sequence_tx(
-            &mut m,
-            id_b.clone(),
-            PendingRethProof {
-                tx_id: id_b.clone(),
-                hyli_tx: BlobTransaction::new(Identity("test".into()), vec![]),
-                tx_ctx: Arc::new(sdk::TxContext::default()),
-                blob_index: sdk::BlobIndex(0),
-                raw_eip2718: raw_b,
-            },
-        );
+        m.handle_sequenced_tx(make_contract_tx(
+            id_a.clone(),
+            &[make_signed_transfer(0)],
+            &cn,
+        ))
+        .await
+        .unwrap();
+        m.handle_sequenced_tx(make_contract_tx(id_b.clone(), &[raw_b], &cn))
+            .await
+            .unwrap();
 
         assert!(m.get_current_state().settled_receipts.contains_key(&hash_b));
 
@@ -845,15 +945,221 @@ mod tests {
     async fn catch_up_failure_removes_from_chain() {
         let mut m = make_module().await;
         m.catching_up = true;
+        let cn = m.contract_name.clone();
 
         let id_a = make_tx_id(1);
-        let pending_a = make_pending(id_a.clone(), 0);
-        m.tx_chain.push(id_a.clone());
-        m.pending_proofs.insert(id_a.clone(), pending_a);
+        // In catch-up mode handle_sequenced_tx just buffers (no proving, no EVM execution).
+        m.handle_sequenced_tx(make_contract_tx(
+            id_a.clone(),
+            &[make_signed_transfer(0)],
+            &cn,
+        ))
+        .await
+        .unwrap();
 
         m.settle_failed_catching_up(&id_a);
 
         assert!(m.tx_chain.is_empty());
         assert!(m.pending_proofs.is_empty());
+    }
+
+    // ── Multi-blob tests ──────────────────────────────────────────────────────
+
+    /// Scenario 1: a single Hyli tx carries two reth blobs.  Both must be proved (applied)
+    /// in order, advancing the block number by 2 and recording both receipts.
+    #[tokio::test]
+    async fn multi_blob_sequence_advances_state_per_blob() {
+        let mut m = make_module().await;
+        let cn = m.contract_name.clone();
+        let id_a = make_tx_id(1);
+
+        let raw_0 = make_signed_transfer(0);
+        let raw_1 = make_signed_transfer(1);
+        let hash_0: [u8; 32] = *alloy_primitives::keccak256(&raw_0);
+        let hash_1: [u8; 32] = *alloy_primitives::keccak256(&raw_1);
+
+        m.handle_sequenced_tx(make_contract_tx(id_a.clone(), &[raw_0, raw_1], &cn))
+            .await
+            .unwrap();
+
+        // Both blobs applied sequentially — block number advances by 2.
+        assert_eq!(m.get_current_state().block_number, 2);
+
+        // Both EVM tx receipts are recorded.
+        let st = m.get_current_state();
+        assert!(
+            st.settled_receipts.contains_key(&hash_0),
+            "blob 0 receipt missing"
+        );
+        assert!(
+            st.settled_receipts.contains_key(&hash_1),
+            "blob 1 receipt missing"
+        );
+
+        // state_history holds the post-last-blob state (not the intermediate one).
+        let (hist, success) = m.state_history.get(&id_a).unwrap();
+        assert_eq!(hist.block_number, 2);
+        assert!(success);
+    }
+
+    /// Scenario 2: a multi-blob Hyli tx fails / times out.  All blob state changes must
+    /// be rolled back atomically — as if neither blob was ever applied.
+    #[tokio::test]
+    async fn multi_blob_rollback_resets_all_blobs() {
+        let mut m = make_module().await;
+        let cn = m.contract_name.clone();
+        let id_a = make_tx_id(1);
+
+        let raw_0 = make_signed_transfer(0);
+        let raw_1 = make_signed_transfer(1);
+        let hash_0: [u8; 32] = *alloy_primitives::keccak256(&raw_0);
+        let hash_1: [u8; 32] = *alloy_primitives::keccak256(&raw_1);
+
+        m.handle_sequenced_tx(make_contract_tx(id_a.clone(), &[raw_0, raw_1], &cn))
+            .await
+            .unwrap();
+        assert_eq!(m.get_current_state().block_number, 2);
+
+        // tx_a fails — both blobs must be fully rolled back.
+        m.rollback_and_replay(&id_a).await;
+
+        assert!(
+            m.tx_chain.is_empty(),
+            "tx_chain must be empty after rollback"
+        );
+        assert_eq!(
+            m.get_current_state().block_number,
+            0,
+            "state must roll back to genesis"
+        );
+        let st = m.get_current_state();
+        assert!(
+            !st.settled_receipts.contains_key(&hash_0),
+            "blob 0 receipt must be gone"
+        );
+        assert!(
+            !st.settled_receipts.contains_key(&hash_1),
+            "blob 1 receipt must be gone"
+        );
+    }
+
+    /// Scenario 3: during catch-up a multi-blob Hyli tx settles successfully.
+    /// `settle_success_catching_up` must:
+    ///   a) apply intermediate blobs speculatively,
+    ///   b) apply the last blob via `apply_transaction` so the sealed header carries the
+    ///      canonical root (not just the field),
+    ///   c) record both receipts and insert the correct state into `state_history`.
+    #[tokio::test]
+    async fn multi_blob_catchup_settle_canonical_root_and_header() {
+        use hyli_modules::modules::contract_listener::ContractChangeData;
+
+        let mut m = make_module().await;
+        m.catching_up = true;
+        let cn = m.contract_name.clone();
+
+        let id_a = make_tx_id(1);
+        let raw_0 = make_signed_transfer(0);
+        let raw_1 = make_signed_transfer(1);
+        let hash_0: [u8; 32] = *alloy_primitives::keccak256(&raw_0);
+        let hash_1: [u8; 32] = *alloy_primitives::keccak256(&raw_1);
+
+        // In catch-up mode handle_sequenced_tx just buffers — no EVM execution yet.
+        m.handle_sequenced_tx(make_contract_tx(id_a.clone(), &[raw_0, raw_1], &cn))
+            .await
+            .unwrap();
+
+        // Use a distinctive canonical root so we can verify it propagates to the header.
+        let canonical_root = [0x42u8; 32];
+        let mut contract_changes = HashMap::new();
+        contract_changes.insert(
+            m.contract_name.clone(),
+            ContractChangeData {
+                change_types: vec![],
+                metadata: None,
+                verifier: "reth".into(),
+                program_id: vec![],
+                state_commitment: canonical_root.to_vec(),
+                soft_timeout: None,
+                hard_timeout: None,
+                deleted_at_height: None,
+            },
+        );
+
+        m.settle_success_catching_up(&id_a, &contract_changes);
+
+        // state_history entry must exist with the canonical root.
+        let (hist, success) = m
+            .state_history
+            .get(&id_a)
+            .expect("state_history must have entry for tx_a");
+        assert!(success);
+        assert_eq!(
+            hist.state_root,
+            alloy_primitives::B256::from(canonical_root),
+            "state_root must equal canonical root"
+        );
+        assert_eq!(hist.block_number, 2, "both blobs applied = 2 blocks");
+
+        // The last sealed header must also carry the canonical root (apply_transaction path).
+        let last_root = hist.header_history.back().unwrap().header().state_root;
+        assert_eq!(
+            last_root,
+            alloy_primitives::B256::from(canonical_root),
+            "last sealed header must be sealed with canonical root, not speculative"
+        );
+
+        // Both EVM receipts must be stored.
+        assert!(
+            hist.settled_receipts.contains_key(&hash_0),
+            "blob 0 receipt missing"
+        );
+        assert!(
+            hist.settled_receipts.contains_key(&hash_1),
+            "blob 1 receipt missing"
+        );
+
+        // Tracking cleaned up.
+        assert!(m.pending_proofs.is_empty());
+        assert!(!m.tx_chain.contains(&id_a));
+    }
+
+    /// Scenario 4: multi-blob tx buffered during catch-up, then `handle_backfill_complete`
+    /// transitions to live mode.  Both blobs must be proved and applied in order — the same
+    /// loop structure as the live-mode sequencing path, but triggered by backfill completion.
+    #[tokio::test]
+    async fn multi_blob_backfill_complete_applies_blobs_in_order() {
+        let mut m = make_module().await;
+        m.catching_up = true;
+        let cn = m.contract_name.clone();
+
+        let id_a = make_tx_id(1);
+        let raw_0 = make_signed_transfer(0);
+        let raw_1 = make_signed_transfer(1);
+        let hash_0: [u8; 32] = *alloy_primitives::keccak256(&raw_0);
+        let hash_1: [u8; 32] = *alloy_primitives::keccak256(&raw_1);
+
+        // Buffer the two-blob tx during catch-up — no state advancement yet.
+        m.handle_sequenced_tx(make_contract_tx(id_a.clone(), &[raw_0, raw_1], &cn))
+            .await
+            .unwrap();
+
+        assert_eq!(m.get_current_state().block_number, 0, "no apply during catch-up");
+        assert!(m.state_history.is_empty(), "no history during catch-up");
+
+        // Backfill completes: blobs proved and applied in order.
+        m.handle_backfill_complete().await;
+
+        assert!(!m.catching_up);
+        assert_eq!(m.get_current_state().block_number, 2, "both blobs applied = 2 blocks");
+
+        // Both receipts recorded.
+        let st = m.get_current_state();
+        assert!(st.settled_receipts.contains_key(&hash_0), "blob 0 receipt missing");
+        assert!(st.settled_receipts.contains_key(&hash_1), "blob 1 receipt missing");
+
+        // state_history holds the post-last-blob state.
+        let (hist, success) = m.state_history.get(&id_a).unwrap();
+        assert_eq!(hist.block_number, 2);
+        assert!(success);
     }
 }
