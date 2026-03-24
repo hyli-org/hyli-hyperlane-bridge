@@ -3,7 +3,13 @@ pub mod handlers;
 pub mod types;
 
 use anyhow::{Context, Result};
-use axum::{extract::State, http::Method, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{Method, StatusCode},
+    response::IntoResponse,
+    routing::post,
+    Json, Router,
+};
 use eth_chain_state::{extract_pending_proofs, submit_reth_proof, EthChainState, PendingProofsMap};
 use hyli_modules::{
     bus::SharedMessageBus,
@@ -15,6 +21,7 @@ use hyli_modules::{
 };
 use sdk::{api::TransactionStatusDb, ContractName, ProgramId};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
@@ -53,6 +60,7 @@ pub struct RethModule {
     base_state: EthChainState,
     pending_proofs: PendingProofsMap,
     catching_up: bool,
+    is_ready: Arc<AtomicBool>,
     /// Ordered list of tx IDs that have been sequenced but not yet settled.
     tx_chain: Vec<sdk::TxId>,
     /// Post-state (and success flag) recorded *after* each tx in `tx_chain` was speculatively
@@ -73,6 +81,8 @@ impl Module for RethModule {
                 .context("Initializing settled EthChainState from genesis JSON")?,
         ));
 
+        let is_ready = Arc::new(AtomicBool::new(false));
+
         let router_ctx = RouterCtx::new(
             ctx.node_url.clone(),
             ctx.hyli_chain_id,
@@ -80,6 +90,7 @@ impl Module for RethModule {
             ctx.hyperlane_cn.clone(),
             ctx.relayer_identity,
             Arc::clone(&settled_eth_chain_state),
+            Arc::clone(&is_ready),
         )
         .context("Building RPC proxy router context")?;
 
@@ -118,6 +129,7 @@ impl Module for RethModule {
             base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: true,
+            is_ready,
             tx_chain: Vec::new(),
             state_history: indexmap::IndexMap::new(),
         })
@@ -249,6 +261,7 @@ impl RethModule {
             "Backfill complete for hyperlane reth contract, starting live proving"
         );
         self.catching_up = false;
+        self.is_ready.store(true, Ordering::Relaxed);
 
         // For txs still pending settlement: prove each blob in order → speculative apply → record.
         let pending_ids: Vec<sdk::TxId> = self.pending_proofs.keys().cloned().collect();
@@ -294,10 +307,30 @@ impl RethModule {
     async fn handle_settled_tx(&mut self, contract_tx: ContractTx) -> Result<()> {
         let ContractTx {
             tx_id,
+            tx,
+            tx_ctx,
             contract_changes,
             status,
-            ..
         } = contract_tx;
+
+        // During catch-up, txs that were already settled before this server instance started
+        // will have a SettledTx event but no prior SequencedTx event (because
+        // query_sequenced_txs only returns txs still in 'sequenced' state).
+        // Extract proofs directly from the blob data so the EVM state and receipts are
+        // replayed correctly.
+        if self.catching_up && !self.tx_chain.contains(&tx_id) {
+            let proofs = eth_chain_state::extract_pending_proofs(
+                tx_id.clone(),
+                tx,
+                tx_ctx,
+                &self.contract_name,
+            );
+            if proofs.is_empty() {
+                return Ok(());
+            }
+            self.tx_chain.push(tx_id.clone());
+            self.pending_proofs.insert(tx_id.clone(), proofs);
+        }
 
         // Only process txs that carried a reth blob for our contract.
         if !self.tx_chain.contains(&tx_id) {
@@ -660,7 +693,19 @@ impl RethModule {
 async fn rpc_handler(
     State(ctx): State<RouterCtx>,
     Json(req): Json<JsonRpcRequest>,
-) -> Json<JsonRpcResponse> {
+) -> impl IntoResponse {
+    if !ctx.is_ready.load(Ordering::Relaxed) {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(JsonRpcResponse::err(
+                req.id,
+                -32000,
+                "Server is still syncing",
+            )),
+        )
+            .into_response();
+    }
+
     let id = req.id.clone();
     let params = &req.params;
 
@@ -698,7 +743,7 @@ async fn rpc_handler(
         info!(method = %req.method, "← RPC ok");
     }
 
-    Json(resp)
+    Json(resp).into_response()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -790,6 +835,7 @@ mod tests {
             base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: false,
+            is_ready: Arc::new(AtomicBool::new(true)),
             tx_chain: Vec::new(),
             state_history: IndexMap::new(),
         }
@@ -1143,19 +1189,33 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(m.get_current_state().block_number, 0, "no apply during catch-up");
+        assert_eq!(
+            m.get_current_state().block_number,
+            0,
+            "no apply during catch-up"
+        );
         assert!(m.state_history.is_empty(), "no history during catch-up");
 
         // Backfill completes: blobs proved and applied in order.
         m.handle_backfill_complete().await;
 
         assert!(!m.catching_up);
-        assert_eq!(m.get_current_state().block_number, 2, "both blobs applied = 2 blocks");
+        assert_eq!(
+            m.get_current_state().block_number,
+            2,
+            "both blobs applied = 2 blocks"
+        );
 
         // Both receipts recorded.
         let st = m.get_current_state();
-        assert!(st.settled_receipts.contains_key(&hash_0), "blob 0 receipt missing");
-        assert!(st.settled_receipts.contains_key(&hash_1), "blob 1 receipt missing");
+        assert!(
+            st.settled_receipts.contains_key(&hash_0),
+            "blob 0 receipt missing"
+        );
+        assert!(
+            st.settled_receipts.contains_key(&hash_1),
+            "blob 1 receipt missing"
+        );
 
         // state_history holds the post-last-blob state.
         let (hist, success) = m.state_history.get(&id_a).unwrap();

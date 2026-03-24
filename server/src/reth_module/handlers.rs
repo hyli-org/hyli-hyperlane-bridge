@@ -6,6 +6,7 @@ use anyhow::Result;
 use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
 use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
 use serde_json::{json, Value};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
@@ -23,6 +24,8 @@ pub struct RouterCtx {
     pub indexer_client: Arc<IndexerApiHttpClient>,
     /// Shared EVM chain state, updated by the module's ContractListener event handler.
     pub eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Set to true once backfilling is complete; RPC requests are rejected until then.
+    pub is_ready: Arc<AtomicBool>,
 }
 
 impl RouterCtx {
@@ -33,6 +36,7 @@ impl RouterCtx {
         hyperlane_cn: ContractName,
         relayer_identity: Identity,
         eth_chain_state: Arc<RwLock<EthChainState>>,
+        is_ready: Arc<AtomicBool>,
     ) -> Result<Self> {
         let node_client = Arc::new(NodeApiHttpClient::new(node_url.clone())?);
         let indexer_client = Arc::new(IndexerApiHttpClient::new(node_url.clone())?);
@@ -44,6 +48,7 @@ impl RouterCtx {
             node_client,
             indexer_client,
             eth_chain_state,
+            is_ready,
         })
     }
 }
