@@ -28,8 +28,7 @@
       "mailbox": "0xfFAEF09B3cd11D9b20d1a19bECca54EEC2884766",
       "blocks": {
         "reorgPeriod": 2,
-        "confirmations": 1,
-        "estimateBlockTime": 60
+        "confirmations": 1
       },
       "index": {
         "chunk": 9,
