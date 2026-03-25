@@ -1,10 +1,11 @@
 'use client'
 
-import type { BridgeStatus } from '@/hooks/useBridge'
+import type { BridgeStatus, Direction } from '@/hooks/useBridge'
 import { ETHERSCAN_BASE_URL, HYLI_EXPLORER_BASE_URL } from '@/lib/hyperlane'
 
 interface TxStatusProps {
   status: BridgeStatus
+  direction: Direction
   onReset: () => void
 }
 
@@ -37,21 +38,9 @@ function PendingCircle() {
   return <div className="h-4 w-4 shrink-0 rounded-full border border-current opacity-30" />
 }
 
-/** One row in the two-step progress display. */
-function StepRow({
-  done,
-  active,
-  failed,
-  label,
-  href,
-  hash,
-}: {
-  done: boolean
-  active: boolean
-  failed: boolean
-  label: string
-  href?: string
-  hash?: string
+function StepRow({ done, active, failed, label, href, hash }: {
+  done: boolean; active: boolean; failed: boolean
+  label: string; href?: string; hash?: string
 }) {
   return (
     <div className="space-y-1">
@@ -60,17 +49,11 @@ function StepRow({
         {failed && <XIcon />}
         {active && <Spinner />}
         {!done && !active && !failed && <PendingCircle />}
-        <span className={active ? 'font-medium' : done && !failed ? 'opacity-60' : ''}>
-          {label}
-        </span>
+        <span className={active ? 'font-medium' : done && !failed ? 'opacity-60' : ''}>{label}</span>
       </div>
       {hash && href && (
-        <a
-          href={href}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="block ml-6 underline hover:opacity-80 font-mono text-xs break-all opacity-70"
-        >
+        <a href={href} target="_blank" rel="noopener noreferrer"
+          className="block ml-6 underline hover:opacity-80 font-mono text-xs break-all opacity-70">
           {hash}
         </a>
       )}
@@ -81,13 +64,24 @@ function StepRow({
   )
 }
 
-export function TxStatus({ status, onReset }: TxStatusProps) {
+export function TxStatus({ status, direction, onReset }: TxStatusProps) {
   if (status.type === 'idle') return null
+
+  const toHyli = direction === 'to_hyli'
+  const srcExplorer = toHyli ? ETHERSCAN_BASE_URL : HYLI_EXPLORER_BASE_URL
+  const dstExplorer = toHyli ? HYLI_EXPLORER_BASE_URL : ETHERSCAN_BASE_URL
+  const srcChain = toHyli ? 'Sepolia' : 'Hyli'
+  const dstChain = toHyli ? 'Hyli' : 'Sepolia'
+
+  // For Hyli→Sepolia, use the Hyli blob tx hash for the explorer link (not the EVM hash).
+  const srcDisplayHash = (status as { txHash?: string; hyliSrcHash?: string }).hyliSrcHash
+    ?? (status as { txHash?: string }).txHash
+  const srcExplorerHref = srcDisplayHash ? `${srcExplorer}/tx/${srcDisplayHash}` : undefined
 
   if (status.type === 'switching_chain') {
     return (
       <div className="p-4 rounded-xl bg-yellow-900/30 border border-yellow-700 text-yellow-300 text-sm">
-        Switching to Sepolia network…
+        Switching to {srcChain} network&hellip;
       </div>
     )
   }
@@ -96,7 +90,7 @@ export function TxStatus({ status, onReset }: TxStatusProps) {
     return (
       <div className="p-4 rounded-xl bg-blue-900/30 border border-blue-700 text-blue-300 text-sm flex items-center gap-3">
         <Spinner />
-        Confirm the transaction in your wallet…
+        Confirm the transaction in your wallet&hellip;
       </div>
     )
   }
@@ -104,29 +98,21 @@ export function TxStatus({ status, onReset }: TxStatusProps) {
   if (status.type === 'confirming') {
     return (
       <div className="p-4 rounded-xl bg-blue-900/30 border border-blue-700 text-blue-300 text-sm space-y-3">
-        <StepRow
-          done={false} active={true} failed={false}
-          label="Bridge out — waiting for Sepolia confirmation…"
-          hash={status.txHash}
-          href={`${ETHERSCAN_BASE_URL}/tx/${status.txHash}`}
-        />
-        <StepRow done={false} active={false} failed={false} label="Bridge in — Hyli relay pending" />
+        <StepRow done={false} active={true} failed={false}
+          label={`Bridge out \u2014 waiting for ${srcChain} confirmation\u2026`}
+          hash={srcDisplayHash} href={srcExplorerHref} />
+        <StepRow done={false} active={false} failed={false} label={`Bridge in \u2014 ${dstChain} relay pending`} />
       </div>
     )
   }
 
-  if (status.type === 'sepolia_reverted') {
+  if (status.type === 'source_reverted') {
     return (
       <div className="p-4 rounded-xl bg-red-900/30 border border-red-700 text-red-300 text-sm space-y-3">
-        <StepRow
-          done={false} active={false} failed={true}
-          label="Bridge out — Sepolia transaction reverted"
-          hash={status.txHash}
-          href={`${ETHERSCAN_BASE_URL}/tx/${status.txHash}`}
-        />
-        <button onClick={onReset} className="text-xs underline text-red-400 hover:text-red-300">
-          Try again
-        </button>
+        <StepRow done={false} active={false} failed={true}
+          label={`Bridge out \u2014 ${srcChain} transaction reverted`}
+          hash={srcDisplayHash} href={srcExplorerHref} />
+        <button onClick={onReset} className="text-xs underline text-red-400 hover:text-red-300">Try again</button>
       </div>
     )
   }
@@ -134,67 +120,46 @@ export function TxStatus({ status, onReset }: TxStatusProps) {
   if (status.type === 'relaying') {
     return (
       <div className="p-4 rounded-xl bg-blue-900/30 border border-blue-700 text-blue-300 text-sm space-y-3">
-        <StepRow
-          done={true} active={false} failed={false}
-          label="Bridge out — confirmed on Sepolia"
-          hash={status.txHash}
-          href={`${ETHERSCAN_BASE_URL}/tx/${status.txHash}`}
-        />
-        <StepRow
-          done={false} active={true} failed={false}
-          label={status.hyliTxHash ? 'Bridge in — confirming on Hyli…' : 'Bridge in — waiting for Hyli relay…'}
-          hash={status.hyliTxHash}
-          href={status.hyliTxHash ? `${HYLI_EXPLORER_BASE_URL}/tx/${status.hyliTxHash}` : undefined}
-        />
+        <StepRow done={true} active={false} failed={false}
+          label={`Bridge out \u2014 confirmed on ${srcChain}`}
+          hash={srcDisplayHash} href={srcExplorerHref} />
+        <StepRow done={false} active={true} failed={false}
+          label={status.destTxHash ? `Bridge in \u2014 confirming on ${dstChain}\u2026` : `Bridge in \u2014 waiting for ${dstChain} relay\u2026`}
+          hash={status.destTxHash}
+          href={status.destTxHash ? `${dstExplorer}/tx/${status.destTxHash}` : undefined} />
       </div>
     )
   }
 
-  if (status.type === 'hyli_success') {
+  if (status.type === 'success') {
     return (
       <div className="p-4 rounded-xl bg-green-900/30 border border-green-700 text-green-300 text-sm space-y-3">
         <p className="font-semibold text-green-200">Bridge complete!</p>
-        <StepRow
-          done={true} active={false} failed={false}
-          label="Bridge out — confirmed on Sepolia"
-          hash={status.txHash}
-          href={`${ETHERSCAN_BASE_URL}/tx/${status.txHash}`}
-        />
-        <StepRow
-          done={true} active={false} failed={false}
-          label="Bridge in — delivered on Hyli"
-          hash={status.hyliTxHash}
-          href={status.hyliTxHash ? `${HYLI_EXPLORER_BASE_URL}/tx/${status.hyliTxHash}` : undefined}
-        />
-        <button onClick={onReset} className="text-xs underline text-green-400 hover:text-green-300">
-          Bridge again
-        </button>
+        <StepRow done={true} active={false} failed={false}
+          label={`Bridge out \u2014 confirmed on ${srcChain}`}
+          hash={srcDisplayHash} href={srcExplorerHref} />
+        <StepRow done={true} active={false} failed={false}
+          label={`Bridge in \u2014 delivered on ${dstChain}`}
+          hash={status.destTxHash}
+          href={status.destTxHash ? `${dstExplorer}/tx/${status.destTxHash}` : undefined} />
+        <button onClick={onReset} className="text-xs underline text-green-400 hover:text-green-300">Bridge again</button>
       </div>
     )
   }
 
-  if (status.type === 'hyli_timeout') {
+  if (status.type === 'timeout') {
     return (
       <div className="p-4 rounded-xl bg-yellow-900/30 border border-yellow-700 text-yellow-300 text-sm space-y-3">
         <p className="font-semibold">Relay is taking longer than expected</p>
-        <StepRow
-          done={true} active={false} failed={false}
-          label="Bridge out — confirmed on Sepolia"
-          hash={status.txHash}
-          href={`${ETHERSCAN_BASE_URL}/tx/${status.txHash}`}
-        />
-        <StepRow
-          done={false} active={false} failed={false}
-          label="Bridge in — Hyli relay pending…"
-          hash={status.hyliTxHash}
-          href={status.hyliTxHash ? `${HYLI_EXPLORER_BASE_URL}/tx/${status.hyliTxHash}` : undefined}
-        />
-        <p className="text-yellow-400/80 text-xs">
-          The relayer may still deliver your funds. Check your Hyli balance later.
-        </p>
-        <button onClick={onReset} className="text-xs underline text-yellow-400 hover:text-yellow-300">
-          Dismiss
-        </button>
+        <StepRow done={true} active={false} failed={false}
+          label={`Bridge out \u2014 confirmed on ${srcChain}`}
+          hash={srcDisplayHash} href={srcExplorerHref} />
+        <StepRow done={false} active={false} failed={false}
+          label={`Bridge in \u2014 ${dstChain} relay pending\u2026`}
+          hash={status.destTxHash}
+          href={status.destTxHash ? `${dstExplorer}/tx/${status.destTxHash}` : undefined} />
+        <p className="text-yellow-400/80 text-xs">The relayer may still deliver your funds. Check your {dstChain} balance later.</p>
+        <button onClick={onReset} className="text-xs underline text-yellow-400 hover:text-yellow-300">Dismiss</button>
       </div>
     )
   }
@@ -204,9 +169,7 @@ export function TxStatus({ status, onReset }: TxStatusProps) {
       <div className="p-4 rounded-xl bg-red-900/30 border border-red-700 text-red-300 text-sm space-y-2">
         <p className="font-semibold">Error</p>
         <p className="text-xs break-all">{status.message}</p>
-        <button onClick={onReset} className="text-xs underline text-red-400 hover:text-red-300">
-          Try again
-        </button>
+        <button onClick={onReset} className="text-xs underline text-red-400 hover:text-red-300">Try again</button>
       </div>
     )
   }

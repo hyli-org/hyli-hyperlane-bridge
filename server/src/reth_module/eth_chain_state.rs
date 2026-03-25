@@ -1,6 +1,7 @@
 use alloy_consensus::proofs::{calculate_receipt_root, calculate_transaction_root};
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
 use alloy_consensus::Header;
+use alloy_consensus::Transaction as _;
 use alloy_consensus::TxReceipt;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_genesis::{ChainConfig, Genesis};
@@ -84,6 +85,10 @@ pub struct EthChainState {
     /// to the Hyli blob tx hash.  Populated only for relay txs (those with the process selector).
     /// TODO: Might be worth removing it at settlement time to save memory, since it's only needed for correlating pending proofs with Hyli tx hashes.
     pub message_id_index: HashMap<[u8; 32], String>,
+    /// Maps EVM tx hash (keccak256 of raw EIP-2718 bytes) to the Hyli blob tx hash returned
+    /// by the node when the transaction was submitted.  Used by `hyli_getHyliHash` so the
+    /// frontend can build correct Hyli explorer links.
+    pub evm_to_hyli_hash: HashMap<[u8; 32], String>,
 }
 
 impl EthChainState {
@@ -144,6 +149,7 @@ impl EthChainState {
             header_history,
             settled_receipts: HashMap::new(),
             message_id_index: HashMap::new(),
+            evm_to_hyli_hash: HashMap::new(),
         })
     }
 
@@ -162,6 +168,8 @@ impl EthChainState {
         let signer = tx
             .recover_signer()
             .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+        self.accounts.entry(signer).or_default().nonce = tx.nonce();
 
         let parent = self
             .header_history
@@ -215,6 +223,8 @@ impl EthChainState {
         let signer = tx
             .recover_signer()
             .map_err(|e| anyhow::anyhow!("Failed to recover signer: {e:?}"))?;
+
+        self.accounts.entry(signer).or_default().nonce = tx.nonce();
 
         let parent = self
             .header_history

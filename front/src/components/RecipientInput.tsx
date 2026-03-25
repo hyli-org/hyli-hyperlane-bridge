@@ -4,13 +4,14 @@ interface RecipientInputProps {
   value: string
   onChange: (value: string) => void
   disabled?: boolean
+  destChainName?: string
 }
 
-export function RecipientInput({ value, onChange, disabled }: RecipientInputProps) {
+export function RecipientInput({ value, onChange, disabled, destChainName = 'Hyli' }: RecipientInputProps) {
   return (
     <div className="space-y-1.5">
       <label className="text-sm font-medium text-gray-300">
-        Recipient on Hyli{' '}
+        Recipient on {destChainName}{' '}
         <span className="text-gray-500 font-normal">(optional — defaults to your address)</span>
       </label>
       <input

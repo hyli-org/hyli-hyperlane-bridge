@@ -6,7 +6,11 @@ import { useWriteContract, useReadContract, useAccount, useSwitchChain, useWaitF
 import {
   SEPOLIA_WARP_CONTRACT,
   SEPOLIA_MAILBOX,
+  HYLI_WARP_CONTRACT,
+  HYLI_MAILBOX,
   HYLI_DOMAIN,
+  HYLI_CHAIN_ID,
+  SEPOLIA_DOMAIN,
   SEPOLIA_CHAIN_ID,
   HYLI_RPC_URL,
   HYLI_INDEXER_URL,
@@ -15,18 +19,25 @@ import {
   encodeRecipient,
 } from '@/lib/hyperlane'
 
+export type Direction = 'to_hyli' | 'to_sepolia'
+
 export type BridgeStatus =
   | { type: 'idle' }
   | { type: 'switching_chain' }
   | { type: 'pending' }
-  | { type: 'confirming'; txHash: `0x${string}` }
-  | { type: 'sepolia_reverted'; txHash: `0x${string}` }
-  | { type: 'relaying'; txHash: `0x${string}`; hyliTxHash?: string }
-  | { type: 'hyli_success'; txHash: `0x${string}`; hyliTxHash?: string }
-  | { type: 'hyli_timeout'; txHash: `0x${string}`; hyliTxHash?: string }
+  | { type: 'confirming'; txHash: `0x${string}`; hyliSrcHash?: string }
+  | { type: 'source_reverted'; txHash: `0x${string}`; hyliSrcHash?: string }
+  | { type: 'relaying'; txHash: `0x${string}`; hyliSrcHash?: string; destTxHash?: string }
+  | { type: 'success'; txHash: `0x${string}`; hyliSrcHash?: string; destTxHash?: string }
+  | { type: 'timeout'; txHash: `0x${string}`; hyliSrcHash?: string; destTxHash?: string }
   | { type: 'error'; message: string }
 
-async function rpcCall(method: string, params: unknown[]): Promise<unknown> {
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+const DISPATCH_ID_TOPIC = keccak256(toBytes('DispatchId(bytes32)'))
+const PROCESS_ID_TOPIC  = keccak256(toBytes('ProcessId(bytes32)'))
+
+async function hyliRpcCall(method: string, params: unknown[]): Promise<unknown> {
   const res = await fetch(HYLI_RPC_URL, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -35,6 +46,18 @@ async function rpcCall(method: string, params: unknown[]): Promise<unknown> {
   const data = await res.json()
   if (data.error) console.warn(`[hyli rpc] ${method} error:`, data.error)
   return data.result
+}
+
+function extractDispatchId(
+  logs: readonly { address: string; topics: readonly string[] }[],
+  mailbox: string,
+): `0x${string}` | undefined {
+  const log = logs.find(
+    l =>
+      l.address.toLowerCase() === mailbox.toLowerCase() &&
+      l.topics[0]?.toLowerCase() === DISPATCH_ID_TOPIC.toLowerCase(),
+  )
+  return log?.topics[1] as `0x${string}` | undefined
 }
 
 async function fetchIndexerTxStatus(hyliTxHash: string): Promise<string | undefined> {
@@ -50,7 +73,7 @@ async function fetchIndexerTxStatus(hyliTxHash: string): Promise<string | undefi
 
 async function fetchHyliTxByMessageId(messageId: `0x${string}`): Promise<string | undefined> {
   try {
-    const result = await rpcCall('hyli_getTxByMessageId', [messageId])
+    const result = await hyliRpcCall('hyli_getTxByMessageId', [messageId])
     if (!result) return undefined
     return (result as { hyliTxHash: string }).hyliTxHash
   } catch {
@@ -58,149 +81,242 @@ async function fetchHyliTxByMessageId(messageId: `0x${string}`): Promise<string 
   }
 }
 
-// keccak256("DispatchId(bytes32)") — emitted by the Sepolia mailbox with the messageId
-const DISPATCH_ID_TOPIC = keccak256(toBytes('DispatchId(bytes32)'))
-
-function extractMessageId(
-  logs: readonly { address: string; topics: readonly string[] }[],
-): `0x${string}` | undefined {
-  const log = logs.find(
-    l =>
-      l.address.toLowerCase() === SEPOLIA_MAILBOX.toLowerCase() &&
-      l.topics[0]?.toLowerCase() === DISPATCH_ID_TOPIC.toLowerCase(),
-  )
-  return log?.topics[1] as `0x${string}` | undefined
+async function fetchHyliHashByEvmHash(evmHash: `0x${string}`): Promise<string | undefined> {
+  try {
+    const result = await hyliRpcCall('hyli_getHyliHash', [evmHash])
+    if (!result) return undefined
+    return (result as { hyliTxHash: string }).hyliTxHash
+  } catch {
+    return undefined
+  }
 }
 
-export function useBridge() {
+async function pollSepoliaProcessId(
+  messageId: `0x${string}`,
+  sepoliaRpcUrl: string,
+  timeoutMs = 120_000,
+): Promise<string | undefined> {
+  const deadline = Date.now() + timeoutMs
+  let fromBlock: string | null = null
+
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 5_000))
+    const blockNumRes = await fetch(sepoliaRpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_blockNumber', params: [] }),
+    })
+    const { result: latestHex = '0x0' } = await blockNumRes.json()
+    const latest = parseInt(latestHex, 16)
+    if (!fromBlock) fromBlock = '0x' + Math.max(0, latest - 20).toString(16)
+
+    const logsRes = await fetch(sepoliaRpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        jsonrpc: '2.0', id: 2, method: 'eth_getLogs',
+        params: [{ address: SEPOLIA_MAILBOX, topics: [PROCESS_ID_TOPIC, messageId], fromBlock, toBlock: 'latest' }],
+      }),
+    })
+    const { result: logs = [] }: { result: { transactionHash: string }[] } = await logsRes.json()
+    if (logs.length > 0) return logs[0].transactionHash
+    fromBlock = latestHex
+  }
+  return undefined
+}
+
+// ── Hook ─────────────────────────────────────────────────────────────────────
+
+export function useBridge(direction: Direction) {
+  const toHyli = direction === 'to_hyli'
+  const sourceChainId  = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
+  const warpContract   = toHyli ? SEPOLIA_WARP_CONTRACT : HYLI_WARP_CONTRACT
+  const destDomain     = toHyli ? HYLI_DOMAIN : SEPOLIA_DOMAIN
+  const sourceMailbox  = toHyli ? SEPOLIA_MAILBOX : HYLI_MAILBOX
+
   const { address, chainId } = useAccount()
-  // Log the RPC URL once so misconfiguration is immediately visible in the console
   useEffect(() => { console.log('[hyli rpc] url:', HYLI_RPC_URL) }, [])
   const { switchChainAsync } = useSwitchChain()
   const { writeContractAsync } = useWriteContract()
   const [status, setStatus] = useState<BridgeStatus>({ type: 'idle' })
 
-  const relayInfo = useRef<{
-    txHash: `0x${string}`
-    messageId?: `0x${string}`
-  } | null>(null)
+  const relayInfo = useRef<{ txHash: `0x${string}`; hyliSrcHash?: string; messageId?: `0x${string}` } | null>(null)
 
+  // quoteGasPayment is only meaningful on Sepolia; Hyli has no interchain gas fee
   const { data: interchainFee = 0n } = useReadContract({
-    address: SEPOLIA_WARP_CONTRACT,
+    address: warpContract,
     abi: QUOTE_GAS_PAYMENT_ABI,
     functionName: 'quoteGasPayment',
-    args: [HYLI_DOMAIN],
-    chainId: SEPOLIA_CHAIN_ID,
+    args: [destDomain],
+    chainId: sourceChainId,
+    query: { enabled: toHyli },
   })
 
-  // Wait for Sepolia tx to be mined
-  const confirmingHash = status.type === 'confirming' ? status.txHash : undefined
+  // Sepolia -> Hyli: use wagmi's built-in receipt watcher for the source tx
+  const confirmingHash = toHyli && status.type === 'confirming' ? status.txHash : undefined
   const { data: sepoliaReceipt, error: sepoliaReceiptError } = useWaitForTransactionReceipt({
     hash: confirmingHash,
     chainId: SEPOLIA_CHAIN_ID,
   })
 
-  // React to Sepolia receipt
   useEffect(() => {
     if (!confirmingHash) return
-    if (sepoliaReceiptError) {
-      setStatus({ type: 'error', message: sepoliaReceiptError.message })
-      return
-    }
+    if (sepoliaReceiptError) { setStatus({ type: 'error', message: sepoliaReceiptError.message }); return }
     if (!sepoliaReceipt) return
     if (sepoliaReceipt.status === 'reverted') {
-      setStatus({ type: 'sepolia_reverted', txHash: confirmingHash })
+      setStatus({ type: 'source_reverted', txHash: confirmingHash })
     } else {
-      // Extract messageId from DispatchId log so we can poll hyli_getTxByMessageId
       if (relayInfo.current) {
-        relayInfo.current.messageId = extractMessageId(sepoliaReceipt.logs)
-        console.log('[hyli poll] messageId:', relayInfo.current.messageId)
+        relayInfo.current.messageId = extractDispatchId(sepoliaReceipt.logs, sourceMailbox)
+        console.log('[bridge] messageId:', relayInfo.current.messageId)
       }
       setStatus({ type: 'relaying', txHash: confirmingHash })
     }
-  }, [sepoliaReceipt, sepoliaReceiptError, confirmingHash])
+  }, [sepoliaReceipt, sepoliaReceiptError, confirmingHash, sourceMailbox])
 
-  // Poll for relay sequencing then settlement
+  // Hyli -> Sepolia: poll Hyli indexer until the source tx settles, then get receipt for logs
+  useEffect(() => {
+    if (toHyli) return
+    if (status.type !== 'confirming') return
+    const info = relayInfo.current
+    if (!info) return
+
+    let cancelled = false
+
+    const timeoutId = setTimeout(() => {
+      if (!cancelled) setStatus({ type: 'timeout', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash })
+    }, 120_000)
+
+    ;(async () => {
+      // Poll indexer until the Hyli tx is settled
+      while (!cancelled) {
+        await new Promise(r => setTimeout(r, 3_000))
+        if (cancelled) break
+        const hyliHash = info.hyliSrcHash
+        if (!hyliHash) continue
+        const txStatus = await fetchIndexerTxStatus(hyliHash)
+        console.log('[bridge] hyli indexer status:', txStatus)
+        if (txStatus === 'Success') break
+        if (txStatus && txStatus !== 'Sequenced') {
+          // Failed / unknown terminal state
+          setStatus({ type: 'source_reverted', txHash: info.txHash, hyliSrcHash: hyliHash })
+          clearTimeout(timeoutId)
+          return
+        }
+      }
+      if (cancelled) return
+
+      // Fetch receipt once to extract the DispatchId messageId from logs
+      const receipt = await hyliRpcCall('eth_getTransactionReceipt', [info.txHash]) as
+        { logs: { address: string; topics: string[] }[] } | null
+      if (cancelled) return
+      if (!receipt) { setStatus({ type: 'source_reverted', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash }); clearTimeout(timeoutId); return }
+
+      const messageId = extractDispatchId(receipt.logs, sourceMailbox)
+      console.log('[bridge] hyli messageId:', messageId)
+      if (!messageId) { setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' }); clearTimeout(timeoutId); return }
+
+      info.messageId = messageId
+      clearTimeout(timeoutId)
+      setStatus({ type: 'relaying', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash })
+    })()
+
+    return () => { cancelled = true; clearTimeout(timeoutId) }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status.type])
+
+  // Relay polling — direction-specific
   useEffect(() => {
     if (status.type !== 'relaying') return
     const info = relayInfo.current
     if (!info) return
 
     let cancelled = false
-    let hyliTxHash: string | undefined
+    let destTxHash: string | undefined
+
+    const hyliSrcHash = info.hyliSrcHash
 
     const timeoutId = setTimeout(() => {
-      if (!cancelled) setStatus({ type: 'hyli_timeout', txHash: info.txHash, hyliTxHash })
+      if (!cancelled) setStatus({ type: 'timeout', txHash: info.txHash, hyliSrcHash, destTxHash })
     }, 120_000)
 
     ;(async () => {
-      while (!cancelled) {
-        await new Promise(r => setTimeout(r, 3_000))
-        if (cancelled) break
+      if (toHyli) {
+        // Sepolia -> Hyli: poll hyli_getTxByMessageId then indexer
+        while (!cancelled) {
+          await new Promise(r => setTimeout(r, 3_000))
+          if (cancelled) break
 
-        // Step 1: resolve the Hyli tx hash (available once the relayer sequences the tx)
-        if (!hyliTxHash && info.messageId) {
-          const found = await fetchHyliTxByMessageId(info.messageId)
-          console.log('[hyli poll] messageId lookup:', found)
-          if (found) {
-            hyliTxHash = found
-            if (!cancelled) setStatus({ type: 'relaying', txHash: info.txHash, hyliTxHash })
+          if (!destTxHash && info.messageId) {
+            const found = await fetchHyliTxByMessageId(info.messageId)
+            console.log('[bridge] hyli tx lookup:', found)
+            if (found) {
+              destTxHash = found
+              if (!cancelled) setStatus({ type: 'relaying', txHash: info.txHash, destTxHash })
+            }
+          }
+
+          if (destTxHash) {
+            const txStatus = await fetchIndexerTxStatus(destTxHash)
+            console.log('[bridge] hyli indexer status:', txStatus)
+            if (txStatus === 'Success') {
+              clearTimeout(timeoutId)
+              if (!cancelled) setStatus({ type: 'success', txHash: info.txHash, destTxHash })
+              return
+            }
           }
         }
+      } else {
+        // Hyli -> Sepolia: messageId already set by the confirming effect; poll Sepolia ProcessId
+        const messageId = info.messageId
+        if (!messageId) { setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' }); clearTimeout(timeoutId); return }
 
-        // Step 2: poll the indexer for settlement
-        if (hyliTxHash) {
-          const txStatus = await fetchIndexerTxStatus(hyliTxHash)
-          console.log('[hyli poll] indexer status:', txStatus)
-          if (txStatus === 'Success') {
-            clearTimeout(timeoutId)
-            if (!cancelled) setStatus({ type: 'hyli_success', txHash: info.txHash, hyliTxHash })
-            return
-          }
-        }
+        const sepoliaRpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL!
+        const sepoliaTx = await pollSepoliaProcessId(messageId, sepoliaRpcUrl, 110_000)
+        if (cancelled) return
+        clearTimeout(timeoutId)
+        if (sepoliaTx) setStatus({ type: 'success', txHash: info.txHash, hyliSrcHash, destTxHash: sepoliaTx })
+        else setStatus({ type: 'timeout', txHash: info.txHash, hyliSrcHash })
       }
     })()
 
-    return () => {
-      cancelled = true
-      clearTimeout(timeoutId)
-    }
+    return () => { cancelled = true; clearTimeout(timeoutId) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [status.type])
 
   async function bridge(amountEth: string, recipient?: `0x${string}`) {
-    if (!address) {
-      setStatus({ type: 'error', message: 'Wallet not connected' })
-      return
-    }
-
+    if (!address) { setStatus({ type: 'error', message: 'Wallet not connected' }); return }
     const recipientAddr = recipient ?? address
-
     try {
-      if (chainId !== SEPOLIA_CHAIN_ID) {
+      if (chainId !== sourceChainId) {
         setStatus({ type: 'switching_chain' })
-        await switchChainAsync({ chainId: SEPOLIA_CHAIN_ID })
+        await switchChainAsync({ chainId: sourceChainId })
       }
-
       setStatus({ type: 'pending' })
-
       const amountWei = parseEther(amountEth)
-      const totalValue = amountWei + interchainFee
 
       const txHash = await writeContractAsync({
-        address: SEPOLIA_WARP_CONTRACT,
+        address: warpContract,
         abi: TRANSFER_REMOTE_ABI,
         functionName: 'transferRemote',
-        args: [HYLI_DOMAIN, encodeRecipient(recipientAddr), amountWei],
-        value: totalValue,
-        chainId: SEPOLIA_CHAIN_ID,
+        args: [destDomain, encodeRecipient(recipientAddr), amountWei],
+        value: toHyli ? amountWei + interchainFee : interchainFee,
+        chainId: sourceChainId,
       })
-
       relayInfo.current = { txHash }
       setStatus({ type: 'confirming', txHash })
+
+      if (!toHyli) {
+        // Hyli→Sepolia: fetch the Hyli blob tx hash for the explorer link and indexer polling.
+        fetchHyliHashByEvmHash(txHash).then(hyliSrcHash => {
+          if (hyliSrcHash && relayInfo.current) {
+            relayInfo.current.hyliSrcHash = hyliSrcHash
+            setStatus(prev => 'txHash' in prev ? { ...prev, hyliSrcHash } : prev)
+          }
+        })
+      }
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error'
-      setStatus({ type: 'error', message })
+      setStatus({ type: 'error', message: err instanceof Error ? err.message : 'Unknown error' })
     }
   }
 
@@ -209,11 +325,5 @@ export function useBridge() {
     setStatus({ type: 'idle' })
   }
 
-  return {
-    bridge,
-    reset,
-    status,
-    interchainFee,
-    isOnSepolia: chainId === SEPOLIA_CHAIN_ID,
-  }
+  return { bridge, reset, status, interchainFee }
 }

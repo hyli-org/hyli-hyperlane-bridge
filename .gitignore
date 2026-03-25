@@ -8,3 +8,4 @@ configs
 .next
 hyperlane_db
 front/tsconfig.tsbuildinfo
+.env.local

@@ -3,21 +3,29 @@
 import { useEffect, useState } from 'react'
 import { useNativeBalance } from '@/hooks/useNativeBalance'
 import { useAccount } from 'wagmi'
+import { SEPOLIA_CHAIN_ID } from '@/lib/hyperlane'
 
 interface AmountInputProps {
   value: string
   onChange: (value: string) => void
   disabled?: boolean
+  sourceChainId?: number
+  sourceChainName?: string
 }
 
-export function AmountInput({ value, onChange, disabled }: AmountInputProps) {
+export function AmountInput({
+  value,
+  onChange,
+  disabled,
+  sourceChainId = SEPOLIA_CHAIN_ID,
+  sourceChainName = 'Sepolia',
+}: AmountInputProps) {
   const { isConnected } = useAccount()
-  const { formatted, symbol } = useNativeBalance()
+  const { formatted, symbol } = useNativeBalance(sourceChainId)
   const [mounted, setMounted] = useState(false)
   useEffect(() => setMounted(true), [])
 
   function handleMax() {
-    // Leave a small buffer for gas
     const bal = parseFloat(formatted)
     if (bal > 0.001) {
       onChange((bal - 0.001).toFixed(6))
@@ -30,7 +38,7 @@ export function AmountInput({ value, onChange, disabled }: AmountInputProps) {
         <label className="text-sm font-medium text-gray-300">Amount</label>
         {mounted && isConnected && (
           <span className="text-xs text-gray-500">
-            Balance:{' '}
+            {sourceChainName}:{' '}
             <button
               onClick={handleMax}
               className="text-blue-400 hover:text-blue-300 underline"

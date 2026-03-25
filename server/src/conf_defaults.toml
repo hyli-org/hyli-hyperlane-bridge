@@ -34,6 +34,26 @@ prover_idle_flush_interval_secs = 2
 # merkleTreeHook: "0xE2c4F00C591Cb6548E02c924240C965A76A3c36e"
 
 # Warp contract on Sepolia: "0x52c2962dd3977e2ed0ef3122f305e3f04e1b0b43"
+# trustedRelayerIsm on Sepolia: "0x5c9DCc5c152956bB0857027eaD0CB214ba401d4C"
+
+# Commands ran to setup everything:
+# export HYP_KEY="0x..." to set private key
+
+#### Deployment of Mailbox (and all needed contracts) on Hyli's instance
+# hyperlane core init
+# hyperlane core deploy
+
+#### Deployment of warp contract on Hyli AND Sepolia
+# hyperlane warp init 
+# hyperlane warp deploy
+
+#### Deployment of trustedRelayerIsm on Sepolia 
+### with the following config:
+# type: trustedRelayerIsm 
+# relayer: "0x68853cc7d3451325053370Ad5F188D8f79F0387c"
+# hyperlane ism deploy --chain sepolia --config ./configs/ism.yaml
+# Link that ISM to Hyli's Warp contract:
+# cast send 0x64E11a41aa0E0d65519fC7B8544ca0d2bD8d0eEF "setInterchainSecurityModule(address)" 0x5c9DCc5c152956bB0857027eaD0CB214ba401d4C --rpc-url https://eth-sepolia.g.alchemy.com/v2/... --private-key $HYP_KEY
 
 evm_config_json = '''
 {
@@ -132,7 +152,7 @@ evm_config_json = '''
     },
     "0x68853cc7d3451325053370ad5f188d8f79f0387c": {
       "balance": "0x3635a723841d576ef2",
-      "nonce": "0x18"
+      "nonce": "0x23"
           },
       "0x6d6fc2b5b6f71b84838c70ed1719c9d498fdb083": {
       "balance": "0x0",

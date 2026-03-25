@@ -734,6 +734,7 @@ async fn rpc_handler(
         "eth_getStorageAt" => handlers::eth_get_storage_at(&ctx, id, params),
         "debug_dumpGenesis" => handlers::debug_dump_genesis(&ctx, id),
         "hyli_getTxByMessageId" => handlers::hyli_get_tx_by_message_id(&ctx, id, params),
+        "hyli_getHyliHash" => handlers::hyli_get_hyli_hash(&ctx, id, params),
         other => JsonRpcResponse::method_not_found(id, other),
     };
 

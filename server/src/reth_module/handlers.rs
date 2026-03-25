@@ -317,7 +317,7 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
 
-    let latest_block = state.block_number;
+    let latest_block = state.block_number + 1;
     let from_block = parse_block_number(filter.get("fromBlock").and_then(|v| v.as_str()), 0);
     let to_block = parse_block_number(filter.get("toBlock").and_then(|v| v.as_str()), latest_block);
 
@@ -383,10 +383,12 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
         .unwrap_or_default();
 
     // Collect and sort receipts by block number for deterministic log ordering.
+    // Use reported block numbers (actual + 1) to stay consistent with eth_blockNumber,
+    // which adds 1 so the relayer always sees a "new" block after each settled tx.
     let mut receipts: Vec<(&[u8; 32], _)> = state
         .settled_receipts
         .iter()
-        .filter(|(_, r)| r.block_number >= from_block && r.block_number <= to_block)
+        .filter(|(_, r)| r.block_number + 1 >= from_block && r.block_number < to_block)
         .collect();
     receipts.sort_by_key(|(_, r)| r.block_number);
 
@@ -432,7 +434,7 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
                 "address": format!("{:?}", log.address),
                 "topics": topics_json,
                 "data": format!("0x{}", hex::encode(log.data.data.as_ref())),
-                "blockNumber": format!("0x{:x}", receipt.block_number),
+                "blockNumber": format!("0x{:x}", receipt.block_number + 1),
                 "transactionHash": format!("0x{}", hex::encode(tx_hash)),
                 "blockHash": format!("0x{}", hex::encode(receipt.block_hash.0)),
                 // Each block contains exactly one transaction (one tx per apply_transaction call).
@@ -499,6 +501,37 @@ pub fn hyli_get_tx_by_message_id(ctx: &RouterCtx, id: Value, params: &Value) -> 
 
     match state.message_id_index.get(&message_id_bytes) {
         Some(hyli_tx_hash) => JsonRpcResponse::ok(id, json!({ "hyliTxHash": hyli_tx_hash })),
+        None => JsonRpcResponse::ok(id, Value::Null),
+    }
+}
+
+// ── hyli_getHyliHash ──────────────────────────────────────────────────────────
+
+/// Custom method: return the Hyli blob tx hash for a given EVM tx hash.
+/// Returns `{"hyliTxHash": "<hex>"}` or `null` if not found.
+pub fn hyli_get_hyli_hash(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
+    let evm_hash_hex = match params.get(0).and_then(|v| v.as_str()) {
+        Some(s) => s.trim_start_matches("0x"),
+        None => return JsonRpcResponse::err(id, -32602, "Missing evmTxHash param"),
+    };
+
+    let evm_hash_bytes: [u8; 32] = match hex::decode(evm_hash_hex)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+    {
+        Some(b) => b,
+        None => {
+            return JsonRpcResponse::err(id, -32602, "Invalid evmTxHash (expected 32-byte hex)")
+        }
+    };
+
+    let state = match ctx.eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+
+    match state.evm_to_hyli_hash.get(&evm_hash_bytes) {
+        Some(hyli_hash) => JsonRpcResponse::ok(id, json!({ "hyliTxHash": hyli_hash })),
         None => JsonRpcResponse::ok(id, Value::Null),
     }
 }
@@ -646,8 +679,15 @@ pub async fn eth_send_raw_transaction(
     ];
 
     let blob_tx = BlobTransaction::new(ctx.relayer_identity.clone(), blobs);
-    if let Err(e) = ctx.node_client.send_tx_blob(blob_tx).await {
-        return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}"));
+    let hyli_tx_hash = match ctx.node_client.send_tx_blob(blob_tx).await {
+        Ok(h) => h,
+        Err(e) => return JsonRpcResponse::internal_error(id, format!("Failed to send tx: {e}")),
+    };
+
+    // Store EVM hash → Hyli blob hash so the frontend can build correct explorer links.
+    let hyli_hash_hex = hex::encode(&hyli_tx_hash.0);
+    if let Ok(mut state) = ctx.eth_chain_state.write() {
+        state.evm_to_hyli_hash.insert(*evm_tx_hash, hyli_hash_hex);
     }
 
     JsonRpcResponse::ok(id, json!(format!("0x{}", hex::encode(*evm_tx_hash))))
@@ -739,6 +779,29 @@ pub async fn eth_get_transaction_receipt(
                 success = r.success,
                 "→ returning receipt"
             );
+            let logs_json: Vec<Value> = r
+                .logs
+                .iter()
+                .enumerate()
+                .map(|(i, log)| {
+                    let topics_json: Vec<String> = log
+                        .topics()
+                        .iter()
+                        .map(|t| format!("0x{}", hex::encode(t.0)))
+                        .collect();
+                    json!({
+                        "address": format!("{:?}", log.address),
+                        "topics": topics_json,
+                        "data": format!("0x{}", hex::encode(log.data.data.as_ref())),
+                        "blockNumber": format!("0x{:x}", r.block_number),
+                        "transactionHash": format!("0x{hash_hex}"),
+                        "blockHash": format!("0x{}", hex::encode(r.block_hash)),
+                        "transactionIndex": "0x0",
+                        "logIndex": format!("0x{:x}", i),
+                        "removed": false,
+                    })
+                })
+                .collect();
             return JsonRpcResponse::ok(
                 id,
                 json!({
@@ -750,7 +813,7 @@ pub async fn eth_get_transaction_receipt(
                     "to": "0x0000000000000000000000000000000000000001",
                     "cumulativeGasUsed": "0x0",
                     "gasUsed": "0x0",
-                    "logs": [],
+                    "logs": logs_json,
                     "logsBloom": "0x".to_string() + &"0".repeat(512),
                     "status": if r.success { "0x1" } else { "0x0" },
                     "type": "0x2",
