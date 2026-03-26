@@ -3,8 +3,9 @@ import { Providers } from './providers'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Hyli Bridge',
+  title: 'Hyli - Bridge',
   description: 'Bridge ETH from Sepolia to Hyli via Hyperlane',
+  icons: { icon: '/favicon.png' },
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
