@@ -1,0 +1,16 @@
+defaultHook:
+  type: merkleTreeHook
+defaultIsm:
+  type: messageIdMultisigIsm
+  threshold: 1
+  validators:
+    - "0x754978a1Bb7ff0Cb4186d6B90350383e32d4Dce7"
+owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+proxyAdmin:
+  owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+requiredHook:
+  beneficiary: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  maxProtocolFee: "100000000000000000"
+  owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  protocolFee: "0"
+  type: protocolFee

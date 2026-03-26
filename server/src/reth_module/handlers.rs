@@ -103,7 +103,18 @@ pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> Js
                 let n_str = tag.trim_start_matches("0x");
                 u64::from_str_radix(n_str, 16)
                     .ok()
-                    .and_then(|n| state.get_header_by_number(n))
+                    .and_then(|n| {
+                        state.get_header_by_number(n).or_else(|| {
+                            // eth_blockNumber reports (block_number + 1) as the current block
+                            // so callers like ethers-rs may request that number directly.
+                            // Fall back to the latest actual header to avoid returning null.
+                            if n == state.block_number + 1 {
+                                state.latest_header()
+                            } else {
+                                None
+                            }
+                        })
+                    })
             }
         });
 

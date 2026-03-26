@@ -1,0 +1,16 @@
+chainId: 1213811785
+domainId: 1213811785
+name: hyli
+displayName: Hyli
+protocol: ethereum
+rpcUrls:
+  - http: http://localhost:9002/rpc
+nativeToken:
+  name: Hyli
+  symbol: HYLI
+  decimals: 18
+interchainGasPaymaster: "0x5330e9c0c88e2b873a5ad2dc3eb469abc6064c9f"
+blocks:
+  reorgPeriod: 0
+  confirmations: 1
+  estimateBlockTime: 5

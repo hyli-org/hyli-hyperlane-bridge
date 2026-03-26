@@ -1,0 +1,18 @@
+hyli:
+  interchainSecurityModule: "0x47dC88dB1Ec40ad18Ce3341e2def1728C82dCf37"
+  isNft: false
+  mailbox: "0x8F87b871a90C67B2D4F2A5a2bF368feaaCBAB21D"
+  owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  proxyAdmin:
+    address: "0x0Cd3432216ACC980e6fF6350798d45eEeD176060"
+    owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  type: synthetic
+sepolia:
+  interchainSecurityModule: "0x8aD387103058212f8283109d212249Bc9a137c02"
+  isNft: false
+  mailbox: "0xfFAEF09B3cd11D9b20d1a19bECca54EEC2884766"
+  owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  proxyAdmin:
+    address: "0x97Bbc6bBaFa5Ce3b2FA966c121Af63bD09e940f8"
+    owner: "0x2CBe875727E95515854a1bC676aDc8C4293e7D7A"
+  type: native

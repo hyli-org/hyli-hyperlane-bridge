@@ -1280,7 +1280,7 @@ pub mod tests {
     // no withdrawals root, no beacon block root.
     pub const TEST_GENESIS: &str = r#"{
         "config": {
-            "chainId": 1337,
+            "chainId": 1213811785,
             "homesteadBlock": 0,
             "eip150Block": 0,
             "eip155Block": 0,
@@ -1309,7 +1309,7 @@ pub mod tests {
     pub fn make_signed_transfer(nonce: u64) -> Vec<u8> {
         let signer: PrivateKeySigner = SIGNER_KEY.parse().unwrap();
         let mut tx = TxEip1559 {
-            chain_id: 1337,
+            chain_id: 1213811785,
             nonce,
             gas_limit: 21_000,
             max_fee_per_gas: 2_000_000_000,
