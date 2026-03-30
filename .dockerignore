@@ -1,2 +1,5 @@
 target
-front
+front/node_modules
+front/.next
+front/tsconfig.tsbuildinfo
+front/.env.local
