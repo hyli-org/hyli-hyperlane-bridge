@@ -143,7 +143,7 @@ fn reject_contract_deployment(tx: &TxEnvelope) -> Result<(), String> {
     };
 
     if is_create {
-        // return Err("Contract deployments are not allowed on this EVM chain".to_string());
+        return Err("Contract deployments are not allowed on this EVM chain".to_string());
     }
 
     Ok(())
