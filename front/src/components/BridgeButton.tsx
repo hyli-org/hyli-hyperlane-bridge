@@ -9,10 +9,11 @@ interface BridgeButtonProps {
   status: BridgeStatus
   direction: Direction
   insufficientFunds: boolean
+  rpcError: string | null
   onBridge: () => void
 }
 
-export function BridgeButton({ amount, status, direction, insufficientFunds, onBridge }: BridgeButtonProps) {
+export function BridgeButton({ amount, status, direction, insufficientFunds, rpcError, onBridge }: BridgeButtonProps) {
   const { isConnected, chainId } = useAccount()
   const toHyli = direction === 'to_hyli'
   const sourceChainId = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
@@ -32,6 +33,7 @@ export function BridgeButton({ amount, status, direction, insufficientFunds, onB
     if (status.type === 'pending') return 'Confirm in wallet...'
     if (status.type === 'confirming') return `Confirming on ${srcChain}...`
     if (status.type === 'relaying') return `Relaying to ${dstChain}...`
+    if (rpcError) return 'Hyli RPC unavailable'
     if (!amount || parseFloat(amount) <= 0) return 'Enter amount'
     if (insufficientFunds) return 'Insufficient balance'
     return `Bridge to ${dstChain}`
@@ -40,7 +42,7 @@ export function BridgeButton({ amount, status, direction, insufficientFunds, onB
   return (
     <button
       onClick={onBridge}
-      disabled={!isConnected || isLoading || !amount || parseFloat(amount) <= 0 || insufficientFunds}
+      disabled={!isConnected || isLoading || !!rpcError || !amount || parseFloat(amount) <= 0 || insufficientFunds}
       className="w-full py-3.5 rounded-xl font-semibold text-white transition-all
         bg-gradient-to-r from-blue-600 to-violet-600
         hover:from-blue-500 hover:to-violet-500

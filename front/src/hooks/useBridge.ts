@@ -12,12 +12,11 @@ import {
   HYLI_CHAIN_ID,
   SEPOLIA_DOMAIN,
   SEPOLIA_CHAIN_ID,
-  HYLI_RPC_URL,
-  HYLI_INDEXER_URL,
   TRANSFER_REMOTE_ABI,
   QUOTE_GAS_PAYMENT_ABI,
   encodeRecipient,
 } from '@/lib/hyperlane'
+import { useRuntimeConfig } from '@/lib/runtimeConfig'
 
 export type Direction = 'to_hyli' | 'to_sepolia'
 
@@ -32,20 +31,45 @@ export type BridgeStatus =
   | { type: 'timeout'; txHash: `0x${string}`; hyliSrcHash?: string; destTxHash?: string }
   | { type: 'error'; message: string }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
 const DISPATCH_ID_TOPIC = keccak256(toBytes('DispatchId(bytes32)'))
-const PROCESS_ID_TOPIC  = keccak256(toBytes('ProcessId(bytes32)'))
+const PROCESS_ID_TOPIC = keccak256(toBytes('ProcessId(bytes32)'))
 
-async function hyliRpcCall(method: string, params: unknown[]): Promise<unknown> {
-  const res = await fetch(HYLI_RPC_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
-  })
-  const data = await res.json()
+function buildHyliRpcUnavailableMessage(hyliRpcUrl: string, error?: unknown) {
+  const detail = error instanceof Error && error.message ? ` ${error.message}` : ''
+  return `Hyli RPC is not accessible at ${hyliRpcUrl}. Check the frontend runtime config and Hyli ingress.${detail}`
+}
+
+function extractErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : 'Unknown error'
+}
+
+async function hyliRpcCall(hyliRpcUrl: string, method: string, params: unknown[]): Promise<unknown> {
+  let response: Response
+
+  try {
+    response = await fetch(hyliRpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+    })
+  } catch (error) {
+    throw new Error(buildHyliRpcUnavailableMessage(hyliRpcUrl, error))
+  }
+
+  if (!response.ok) {
+    throw new Error(buildHyliRpcUnavailableMessage(hyliRpcUrl, new Error(`HTTP ${response.status}`)))
+  }
+
+  const data = await response.json()
   if (data.error) console.warn(`[hyli rpc] ${method} error:`, data.error)
   return data.result
+}
+
+async function checkHyliRpcAvailability(hyliRpcUrl: string) {
+  const chainId = await hyliRpcCall(hyliRpcUrl, 'eth_chainId', [])
+  if (typeof chainId !== 'string' || chainId.length === 0) {
+    throw new Error(buildHyliRpcUnavailableMessage(hyliRpcUrl))
+  }
 }
 
 function extractDispatchId(
@@ -60,20 +84,20 @@ function extractDispatchId(
   return log?.topics[1] as `0x${string}` | undefined
 }
 
-async function fetchIndexerTxStatus(hyliTxHash: string): Promise<string | undefined> {
+async function fetchIndexerTxStatus(hyliIndexerUrl: string, hyliTxHash: string): Promise<string | undefined> {
   try {
-    const res = await fetch(`${HYLI_INDEXER_URL}/v1/indexer/transaction/hash/${hyliTxHash}`)
-    if (!res.ok) return undefined
-    const data = await res.json()
+    const response = await fetch(`${hyliIndexerUrl}/v1/indexer/transaction/hash/${hyliTxHash}`)
+    if (!response.ok) return undefined
+    const data = await response.json()
     return data.transaction_status as string
   } catch {
     return undefined
   }
 }
 
-async function fetchHyliTxByMessageId(messageId: `0x${string}`): Promise<string | undefined> {
+async function fetchHyliTxByMessageId(hyliRpcUrl: string, messageId: `0x${string}`): Promise<string | undefined> {
   try {
-    const result = await hyliRpcCall('hyli_getTxByMessageId', [messageId])
+    const result = await hyliRpcCall(hyliRpcUrl, 'hyli_getTxByMessageId', [messageId])
     if (!result) return undefined
     return (result as { hyliTxHash: string }).hyliTxHash
   } catch {
@@ -81,9 +105,9 @@ async function fetchHyliTxByMessageId(messageId: `0x${string}`): Promise<string 
   }
 }
 
-async function fetchHyliHashByEvmHash(evmHash: `0x${string}`): Promise<string | undefined> {
+async function fetchHyliHashByEvmHash(hyliRpcUrl: string, evmHash: `0x${string}`): Promise<string | undefined> {
   try {
-    const result = await hyliRpcCall('hyli_getHyliHash', [evmHash])
+    const result = await hyliRpcCall(hyliRpcUrl, 'hyli_getHyliHash', [evmHash])
     if (!result) return undefined
     return (result as { hyliTxHash: string }).hyliTxHash
   } catch {
@@ -114,7 +138,9 @@ async function pollSepoliaProcessId(
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        jsonrpc: '2.0', id: 2, method: 'eth_getLogs',
+        jsonrpc: '2.0',
+        id: 2,
+        method: 'eth_getLogs',
         params: [{ address: SEPOLIA_MAILBOX, topics: [PROCESS_ID_TOPIC, messageId], fromBlock, toBlock: 'latest' }],
       }),
     })
@@ -125,24 +151,43 @@ async function pollSepoliaProcessId(
   return undefined
 }
 
-// ── Hook ─────────────────────────────────────────────────────────────────────
-
 export function useBridge(direction: Direction) {
+  const { hyliRpcUrl, hyliIndexerUrl } = useRuntimeConfig()
   const toHyli = direction === 'to_hyli'
-  const sourceChainId  = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
-  const warpContract   = toHyli ? SEPOLIA_WARP_CONTRACT : HYLI_WARP_CONTRACT
-  const destDomain     = toHyli ? HYLI_DOMAIN : SEPOLIA_DOMAIN
-  const sourceMailbox  = toHyli ? SEPOLIA_MAILBOX : HYLI_MAILBOX
+  const sourceChainId = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
+  const warpContract = toHyli ? SEPOLIA_WARP_CONTRACT : HYLI_WARP_CONTRACT
+  const destDomain = toHyli ? HYLI_DOMAIN : SEPOLIA_DOMAIN
+  const sourceMailbox = toHyli ? SEPOLIA_MAILBOX : HYLI_MAILBOX
 
   const { address, chainId } = useAccount()
-  useEffect(() => { console.log('[hyli rpc] url:', HYLI_RPC_URL) }, [])
   const { switchChainAsync } = useSwitchChain()
   const { writeContractAsync } = useWriteContract()
   const [status, setStatus] = useState<BridgeStatus>({ type: 'idle' })
+  const [rpcError, setRpcError] = useState<string | null>(null)
 
   const relayInfo = useRef<{ txHash: `0x${string}`; hyliSrcHash?: string; messageId?: `0x${string}` } | null>(null)
 
-  // quoteGasPayment is only meaningful on Sepolia; Hyli has no interchain gas fee
+  useEffect(() => {
+    console.log('[hyli rpc] url:', hyliRpcUrl)
+  }, [hyliRpcUrl])
+
+  useEffect(() => {
+    let cancelled = false
+
+    ;(async () => {
+      try {
+        await checkHyliRpcAvailability(hyliRpcUrl)
+        if (!cancelled) setRpcError(null)
+      } catch (error) {
+        if (!cancelled) setRpcError(extractErrorMessage(error))
+      }
+    })()
+
+    return () => {
+      cancelled = true
+    }
+  }, [hyliRpcUrl])
+
   const { data: interchainFee = 0n } = useReadContract({
     address: warpContract,
     abi: QUOTE_GAS_PAYMENT_ABI,
@@ -152,7 +197,6 @@ export function useBridge(direction: Direction) {
     query: { enabled: toHyli },
   })
 
-  // Sepolia -> Hyli: use wagmi's built-in receipt watcher for the source tx
   const confirmingHash = toHyli && status.type === 'confirming' ? status.txHash : undefined
   const { data: sepoliaReceipt, error: sepoliaReceiptError } = useWaitForTransactionReceipt({
     hash: confirmingHash,
@@ -161,7 +205,10 @@ export function useBridge(direction: Direction) {
 
   useEffect(() => {
     if (!confirmingHash) return
-    if (sepoliaReceiptError) { setStatus({ type: 'error', message: sepoliaReceiptError.message }); return }
+    if (sepoliaReceiptError) {
+      setStatus({ type: 'error', message: sepoliaReceiptError.message })
+      return
+    }
     if (!sepoliaReceipt) return
     if (sepoliaReceipt.status === 'reverted') {
       setStatus({ type: 'source_reverted', txHash: confirmingHash })
@@ -174,7 +221,6 @@ export function useBridge(direction: Direction) {
     }
   }, [sepoliaReceipt, sepoliaReceiptError, confirmingHash, sourceMailbox])
 
-  // Hyli -> Sepolia: poll Hyli indexer until the source tx settles, then get receipt for logs
   useEffect(() => {
     if (toHyli) return
     if (status.type !== 'confirming') return
@@ -188,17 +234,15 @@ export function useBridge(direction: Direction) {
     }, 120_000)
 
     ;(async () => {
-      // Poll indexer until the Hyli tx is settled
       while (!cancelled) {
         await new Promise(r => setTimeout(r, 3_000))
         if (cancelled) break
         const hyliHash = info.hyliSrcHash
         if (!hyliHash) continue
-        const txStatus = await fetchIndexerTxStatus(hyliHash)
+        const txStatus = await fetchIndexerTxStatus(hyliIndexerUrl, hyliHash)
         console.log('[bridge] hyli indexer status:', txStatus)
         if (txStatus === 'Success') break
         if (txStatus && txStatus !== 'Sequenced') {
-          // Failed / unknown terminal state
           setStatus({ type: 'source_reverted', txHash: info.txHash, hyliSrcHash: hyliHash })
           clearTimeout(timeoutId)
           return
@@ -206,26 +250,37 @@ export function useBridge(direction: Direction) {
       }
       if (cancelled) return
 
-      // Fetch receipt once to extract the DispatchId messageId from logs
-      const receipt = await hyliRpcCall('eth_getTransactionReceipt', [info.txHash]) as
+      const receipt = await hyliRpcCall(hyliRpcUrl, 'eth_getTransactionReceipt', [info.txHash]) as
         { logs: { address: string; topics: string[] }[] } | null
       if (cancelled) return
-      if (!receipt) { setStatus({ type: 'source_reverted', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash }); clearTimeout(timeoutId); return }
+      if (!receipt) {
+        setStatus({ type: 'source_reverted', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash })
+        clearTimeout(timeoutId)
+        return
+      }
 
       const messageId = extractDispatchId(receipt.logs, sourceMailbox)
       console.log('[bridge] hyli messageId:', messageId)
-      if (!messageId) { setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' }); clearTimeout(timeoutId); return }
+      if (!messageId) {
+        setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' })
+        clearTimeout(timeoutId)
+        return
+      }
 
       info.messageId = messageId
       clearTimeout(timeoutId)
       setStatus({ type: 'relaying', txHash: info.txHash, hyliSrcHash: info.hyliSrcHash })
-    })()
+    })().catch(error => {
+      clearTimeout(timeoutId)
+      if (!cancelled) setStatus({ type: 'error', message: extractErrorMessage(error) })
+    })
 
-    return () => { cancelled = true; clearTimeout(timeoutId) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status.type])
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [hyliIndexerUrl, hyliRpcUrl, sourceMailbox, status.type, toHyli])
 
-  // Relay polling — direction-specific
   useEffect(() => {
     if (status.type !== 'relaying') return
     const info = relayInfo.current
@@ -242,13 +297,12 @@ export function useBridge(direction: Direction) {
 
     ;(async () => {
       if (toHyli) {
-        // Sepolia -> Hyli: poll hyli_getTxByMessageId then indexer
         while (!cancelled) {
           await new Promise(r => setTimeout(r, 3_000))
           if (cancelled) break
 
           if (!destTxHash && info.messageId) {
-            const found = await fetchHyliTxByMessageId(info.messageId)
+            const found = await fetchHyliTxByMessageId(hyliRpcUrl, info.messageId)
             console.log('[bridge] hyli tx lookup:', found)
             if (found) {
               destTxHash = found
@@ -257,7 +311,7 @@ export function useBridge(direction: Direction) {
           }
 
           if (destTxHash) {
-            const txStatus = await fetchIndexerTxStatus(destTxHash)
+            const txStatus = await fetchIndexerTxStatus(hyliIndexerUrl, destTxHash)
             console.log('[bridge] hyli indexer status:', txStatus)
             if (txStatus === 'Success') {
               clearTimeout(timeoutId)
@@ -267,9 +321,12 @@ export function useBridge(direction: Direction) {
           }
         }
       } else {
-        // Hyli -> Sepolia: messageId already set by the confirming effect; poll Sepolia ProcessId
         const messageId = info.messageId
-        if (!messageId) { setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' }); clearTimeout(timeoutId); return }
+        if (!messageId) {
+          setStatus({ type: 'error', message: 'No DispatchId event in Hyli receipt' })
+          clearTimeout(timeoutId)
+          return
+        }
 
         const sepoliaRpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL!
         const sepoliaTx = await pollSepoliaProcessId(messageId, sepoliaRpcUrl, 110_000)
@@ -278,14 +335,27 @@ export function useBridge(direction: Direction) {
         if (sepoliaTx) setStatus({ type: 'success', txHash: info.txHash, hyliSrcHash, destTxHash: sepoliaTx })
         else setStatus({ type: 'timeout', txHash: info.txHash, hyliSrcHash })
       }
-    })()
+    })().catch(error => {
+      clearTimeout(timeoutId)
+      if (!cancelled) setStatus({ type: 'error', message: extractErrorMessage(error) })
+    })
 
-    return () => { cancelled = true; clearTimeout(timeoutId) }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [status.type])
+    return () => {
+      cancelled = true
+      clearTimeout(timeoutId)
+    }
+  }, [hyliIndexerUrl, hyliRpcUrl, status.type, toHyli])
 
   async function bridge(amountEth: string, recipient?: `0x${string}`) {
-    if (!address) { setStatus({ type: 'error', message: 'Wallet not connected' }); return }
+    if (!address) {
+      setStatus({ type: 'error', message: 'Wallet not connected' })
+      return
+    }
+    if (rpcError) {
+      setStatus({ type: 'error', message: rpcError })
+      return
+    }
+
     const recipientAddr = recipient ?? address
     try {
       if (chainId !== sourceChainId) {
@@ -307,16 +377,15 @@ export function useBridge(direction: Direction) {
       setStatus({ type: 'confirming', txHash })
 
       if (!toHyli) {
-        // Hyli→Sepolia: fetch the Hyli blob tx hash for the explorer link and indexer polling.
-        fetchHyliHashByEvmHash(txHash).then(hyliSrcHash => {
+        fetchHyliHashByEvmHash(hyliRpcUrl, txHash).then(hyliSrcHash => {
           if (hyliSrcHash && relayInfo.current) {
             relayInfo.current.hyliSrcHash = hyliSrcHash
             setStatus(prev => 'txHash' in prev ? { ...prev, hyliSrcHash } : prev)
           }
         })
       }
-    } catch (err) {
-      setStatus({ type: 'error', message: err instanceof Error ? err.message : 'Unknown error' })
+    } catch (error) {
+      setStatus({ type: 'error', message: extractErrorMessage(error) })
     }
   }
 
@@ -325,5 +394,5 @@ export function useBridge(direction: Direction) {
     setStatus({ type: 'idle' })
   }
 
-  return { bridge, reset, status, interchainFee }
+  return { bridge, reset, status, interchainFee, rpcError }
 }

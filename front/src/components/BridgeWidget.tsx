@@ -25,7 +25,7 @@ export function BridgeWidget() {
   const toChain   = toHyli ? 'Hyli' : 'Sepolia'
   const sourceChainId = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
 
-  const { bridge, reset, status, interchainFee } = useBridge(direction)
+  const { bridge, reset, status, interchainFee, rpcError } = useBridge(direction)
   const { balance } = useNativeBalance(sourceChainId)
 
   let amountWei = 0n
@@ -93,8 +93,15 @@ export function BridgeWidget() {
         <RecipientInput value={recipient} onChange={setRecipient} disabled={isBusy} destChainName={toChain} />
 
         {/* Action */}
+        {rpcError && (
+          <div className="rounded-xl border border-red-700 bg-red-900/30 p-3 text-sm text-red-200">
+            <p className="font-semibold">Hyli RPC unavailable</p>
+            <p className="mt-1 break-all text-xs text-red-300">{rpcError}</p>
+          </div>
+        )}
+
         {mounted && isConnected ? (
-          <BridgeButton amount={amount} status={status} direction={direction} insufficientFunds={insufficientFunds} onBridge={handleBridge} />
+          <BridgeButton amount={amount} status={status} direction={direction} insufficientFunds={insufficientFunds} rpcError={rpcError} onBridge={handleBridge} />
         ) : (
           <p className="text-center text-sm text-gray-500">Connect your wallet to bridge</p>
         )}
