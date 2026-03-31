@@ -36,6 +36,7 @@ use tracing::{debug, info, warn};
 /// Minimal receipt info stored after a transaction settles on Hyli.
 #[derive(Debug, Clone)]
 pub struct EthTxReceipt {
+    pub raw_eip2718: Vec<u8>,
     pub block_number: u64,
     pub block_hash: B256,
     pub success: bool,
@@ -709,6 +710,7 @@ impl EthChainState {
         self.settled_receipts.insert(
             evm_hash,
             EthTxReceipt {
+                raw_eip2718: raw_eip2718.to_vec(),
                 block_number,
                 block_hash,
                 success,

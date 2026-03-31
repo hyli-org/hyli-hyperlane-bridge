@@ -26,7 +26,7 @@ use std::sync::{Arc, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn};
 
-use handlers::RouterCtx;
+use handlers::{RouterCtx, SubmittedTx};
 use types::{JsonRpcRequest, JsonRpcResponse};
 
 module_bus_client! {
@@ -56,8 +56,12 @@ pub struct RethModule {
     /// Settled EVM state: advances only when a transaction is confirmed on Hyli.
     /// This is the state exposed via RPC so clients never observe speculative changes.
     settled_eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Published pending/speculative EVM snapshot exposed via RPC.
+    pending_eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Locally submitted EVM transactions keyed by EVM tx hash.
+    submitted_txs: Arc<RwLock<HashMap<[u8; 32], SubmittedTx>>>,
     /// Genesis state — fallback base for `get_state_of_prev_tx` when no history entry exists.
-    base_state: EthChainState,
+    base_state: Arc<EthChainState>,
     pending_proofs: PendingProofsMap,
     catching_up: bool,
     is_ready: Arc<AtomicBool>,
@@ -73,13 +77,20 @@ impl Module for RethModule {
     type Context = RethModuleCtx;
 
     async fn build(bus: SharedMessageBus, ctx: Self::Context) -> Result<Self> {
-        let base_state = EthChainState::new(&ctx.evm_config_json)
-            .context("Initializing base EthChainState from genesis JSON")?;
+        let base_state = Arc::new(
+            EthChainState::new(&ctx.evm_config_json)
+                .context("Initializing base EthChainState from genesis JSON")?,
+        );
 
         let settled_eth_chain_state = Arc::new(RwLock::new(
             EthChainState::new(&ctx.evm_config_json)
                 .context("Initializing settled EthChainState from genesis JSON")?,
         ));
+        let pending_eth_chain_state = Arc::new(RwLock::new(
+            EthChainState::new(&ctx.evm_config_json)
+                .context("Initializing pending EthChainState from genesis JSON")?,
+        ));
+        let submitted_txs = Arc::new(RwLock::new(HashMap::new()));
 
         let is_ready = Arc::new(AtomicBool::new(false));
 
@@ -90,6 +101,8 @@ impl Module for RethModule {
             ctx.hyperlane_cn.clone(),
             ctx.relayer_identity,
             Arc::clone(&settled_eth_chain_state),
+            Arc::clone(&pending_eth_chain_state),
+            Arc::clone(&submitted_txs),
             Arc::clone(&is_ready),
         )
         .context("Building RPC proxy router context")?;
@@ -126,6 +139,8 @@ impl Module for RethModule {
             contract_name: ctx.hyperlane_cn,
             program_id: hyperlane_program_id,
             settled_eth_chain_state,
+            pending_eth_chain_state,
+            submitted_txs,
             base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: true,
@@ -214,7 +229,14 @@ impl RethModule {
         for pending in &proofs {
             // 1. Snapshot the current pre-state and submit the proof.
             let pre_state = self.get_current_state();
-            self.try_prove(pre_state, pending.clone()).await;
+            let proof_built = self.try_prove(pre_state, pending.clone()).await;
+
+            // If proof building failed (e.g. bad nonce), roll back immediately so that
+            // subsequent transactions are not built on a poisoned speculative state.
+            if !proof_built {
+                self.rollback_and_replay(&tx_id).await;
+                return Ok(());
+            }
 
             // 2. Advance state speculatively.
             let mut state = self.get_current_state();
@@ -247,6 +269,7 @@ impl RethModule {
         }
 
         self.pending_proofs.insert(tx_id, proofs);
+        self.publish_pending_rpc_state();
         Ok(())
     }
 
@@ -279,7 +302,8 @@ impl RethModule {
 
             for pending in &proofs {
                 let pre_state = self.get_current_state();
-                self.try_prove(pre_state, pending.clone()).await;
+                // Ignore build result during catch-up replay — no further rollback possible here.
+                let _ = self.try_prove(pre_state, pending.clone()).await;
 
                 let mut state = self.get_current_state();
                 let success = match state.apply_transaction_speculative(&pending.raw_eip2718) {
@@ -459,8 +483,10 @@ impl RethModule {
             }
         }
 
+        self.remove_submitted_txs_for(tx_id);
         self.tx_chain.retain(|id| id != tx_id);
         self.pending_proofs.shift_remove(tx_id);
+        self.publish_pending_rpc_state();
     }
 
     /// Confirm the canonical state root for a successfully-settled tx in live mode.
@@ -481,7 +507,15 @@ impl RethModule {
 
                 // Advance the settled (RPC-facing) state using the post-state from history,
                 // correcting the state root to the canonical value from Hyli.
-                if let Some((hist_state, _success)) = self.state_history.get_mut(tx_id) {
+                //
+                // If the tx is absent from state_history (proof building failed and
+                // rollback_and_replay removed it before settlement), push a fallback block so
+                // that settled_eth_chain_state.block_number still advances.  This mirrors the
+                // old behaviour where speculative apply always ran (even as a fallback) and
+                // state_history was always populated.
+                let settled = if let Some((hist_state, _success)) =
+                    self.state_history.get_mut(tx_id)
+                {
                     if hist_state.state_root != canonical {
                         warn!(
                             tx_id =% tx_id,
@@ -491,11 +525,25 @@ impl RethModule {
                         );
                         hist_state.state_root = canonical;
                     }
-                    let settled = hist_state.clone();
-                    match self.settled_eth_chain_state.write() {
-                        Ok(mut s) => *s = settled,
-                        Err(e) => warn!("settled_eth_chain_state write lock poisoned: {:?}", e),
-                    }
+                    hist_state.clone()
+                } else {
+                    // No speculative post-state — advance with a fallback block.
+                    warn!(tx_id =% tx_id, "No state_history entry at settlement — applying fallback block");
+                    let mut fallback = match self.settled_eth_chain_state.read() {
+                        Ok(s) => s.clone(),
+                        Err(e) => {
+                            warn!("settled_eth_chain_state read lock poisoned: {:?}", e);
+                            return;
+                        }
+                    };
+                    fallback.state_root = canonical;
+                    fallback.block_number += 1;
+                    fallback.push_fallback_header();
+                    fallback
+                };
+                match self.settled_eth_chain_state.write() {
+                    Ok(mut s) => *s = settled,
+                    Err(e) => warn!("settled_eth_chain_state write lock poisoned: {:?}", e),
                 }
 
                 // Prune previous tx's history entry (it's no longer needed as a rollback base).
@@ -525,14 +573,18 @@ impl RethModule {
             }
         }
 
+        self.remove_submitted_txs_for(tx_id);
         self.pending_proofs.shift_remove(tx_id);
+        self.publish_pending_rpc_state();
     }
 
     /// Remove a failed/timed-out tx from tracking during catch-up (no speculative state to roll back).
     fn settle_failed_catching_up(&mut self, tx_id: &sdk::TxId) {
         info!(tx_id =% tx_id, "🔥 Failed/timed-out tx during catch-up — removing from chain");
+        self.remove_submitted_txs_for(tx_id);
         self.tx_chain.retain(|id| id != tx_id);
         self.pending_proofs.shift_remove(tx_id);
+        self.publish_pending_rpc_state();
     }
 
     /// Find the `EthChainState` that existed *before* `tx_id` was applied.
@@ -547,7 +599,7 @@ impl RethModule {
                 tx_id =% tx_id,
                 "tx not in tx_chain — returning base state"
             );
-            return self.base_state.clone();
+            return (*self.base_state).clone();
         };
         for idx in (0..pos).rev() {
             let prev = &self.tx_chain[idx];
@@ -555,7 +607,7 @@ impl RethModule {
                 return state.clone();
             }
         }
-        self.base_state.clone()
+        (*self.base_state).clone()
     }
 
     /// Roll back `EthChainState` to the state before `tx_id` was applied (using `state_history`),
@@ -565,7 +617,9 @@ impl RethModule {
     async fn rollback_and_replay(&mut self, tx_id: &sdk::TxId) {
         let Some(pos) = self.tx_chain.iter().position(|id| id == tx_id) else {
             warn!(tx_id =% tx_id, "Failed tx not in tx_chain — skipping rollback");
+            self.remove_submitted_txs_for(tx_id);
             self.pending_proofs.shift_remove(tx_id);
+            self.publish_pending_rpc_state();
             return;
         };
 
@@ -584,6 +638,7 @@ impl RethModule {
         // means get_current_state() will return the correct pre-state for replay.
         self.state_history.shift_remove(tx_id);
         self.tx_chain.remove(pos);
+        self.remove_submitted_txs_for(tx_id);
         self.pending_proofs.shift_remove(tx_id);
 
         // Clear state_history for all subsequent txs — they must be re-executed and re-proved
@@ -604,7 +659,8 @@ impl RethModule {
             for pending in &proofs {
                 // Re-prove against the now-correct pre-state.
                 let pre_state = self.get_current_state();
-                self.try_prove(pre_state, pending.clone()).await;
+                // Ignore build result during replay — no further rollback from within rollback.
+                let _ = self.try_prove(pre_state, pending.clone()).await;
 
                 // Re-advance state speculatively and overwrite state_history[sub_id] with latest.
                 let mut state = self.get_current_state();
@@ -629,6 +685,8 @@ impl RethModule {
                 self.state_history.insert(sub_id.clone(), (state, success));
             }
         }
+
+        self.publish_pending_rpc_state();
     }
 
     /// Returns the current speculative EVM state: the post-state of the latest tx in
@@ -638,7 +696,57 @@ impl RethModule {
             .values()
             .next_back()
             .map(|(s, _)| s.clone())
-            .unwrap_or_else(|| self.base_state.clone())
+            .unwrap_or_else(|| (*self.base_state).clone())
+    }
+
+    fn publish_pending_rpc_state(&self) {
+        // When no speculative txs are in flight, fall back to the settled state rather than
+        // base_state (genesis) — contracts deployed by past settled txs would otherwise be
+        // invisible to "pending" eth_calls.
+        let mut current = if self.state_history.is_empty() {
+            match self.settled_eth_chain_state.read() {
+                Ok(s) => s.clone(),
+                Err(e) => {
+                    warn!("settled_eth_chain_state read lock poisoned: {:?}", e);
+                    return;
+                }
+            }
+        } else {
+            self.get_current_state()
+        };
+        if let Ok(settled) = self.settled_eth_chain_state.read() {
+            current.message_id_index = settled.message_id_index.clone();
+            current.evm_to_hyli_hash = settled.evm_to_hyli_hash.clone();
+        }
+        if let Ok(submitted) = self.submitted_txs.read() {
+            for (hash, tx) in submitted.iter() {
+                current
+                    .evm_to_hyli_hash
+                    .insert(*hash, tx.hyli_tx_hash.clone());
+            }
+        }
+        match self.pending_eth_chain_state.write() {
+            Ok(mut state) => *state = current,
+            Err(e) => warn!("pending_eth_chain_state write lock poisoned: {:?}", e),
+        }
+    }
+
+    fn remove_submitted_txs_for(&self, tx_id: &sdk::TxId) {
+        let Some(proofs) = self.pending_proofs.get(tx_id) else {
+            return;
+        };
+        let hashes: Vec<[u8; 32]> = proofs
+            .iter()
+            .map(|pending| *alloy_primitives::keccak256(&pending.raw_eip2718))
+            .collect();
+        match self.submitted_txs.write() {
+            Ok(mut submitted) => {
+                for hash in hashes {
+                    submitted.remove(&hash);
+                }
+            }
+            Err(e) => warn!("submitted_txs write lock poisoned: {:?}", e),
+        }
     }
 
     /// Attempt to build and submit a reth proof for a pending transaction.
@@ -646,11 +754,15 @@ impl RethModule {
     /// `pre_state` must be the EVM state that existed *before* `pending` is applied — the caller
     /// is responsible for snapshotting it at the right moment, especially when multiple blobs
     /// within one Hyli tx are proved sequentially.
+    ///
+    /// Returns `false` if proof *building* failed (invalid tx — caller should rollback
+    /// immediately).  Returns `true` if the proof was built successfully, even if submission
+    /// subsequently failed (a network hiccup is not a reason to discard the speculative state).
     async fn try_prove(
         &self,
         pre_state: EthChainState,
         pending: eth_chain_state::PendingRethProof,
-    ) {
+    ) -> bool {
         let tx_id = pending.tx_id.clone();
 
         match pre_state.build_proof_payload(&pending) {
@@ -677,12 +789,14 @@ impl RethModule {
                         );
                     }
                 }
+                true
             }
             Err(e) => {
                 error!(
                     tx_id =% tx_id,
                     "Failed to build reth proof payload: {e:#}"
                 );
+                false
             }
         }
     }
@@ -816,8 +930,11 @@ mod tests {
             hyli_turmoil_shims::init_noop_meter_provider();
         });
 
-        let base_state = EthChainState::new(TEST_GENESIS.as_bytes()).unwrap();
+        let base_state = Arc::new(EthChainState::new(TEST_GENESIS.as_bytes()).unwrap());
         let settled_eth_chain_state = Arc::new(RwLock::new(
+            EthChainState::new(TEST_GENESIS.as_bytes()).unwrap(),
+        ));
+        let pending_eth_chain_state = Arc::new(RwLock::new(
             EthChainState::new(TEST_GENESIS.as_bytes()).unwrap(),
         ));
         let bus = SharedMessageBus::new();
@@ -833,6 +950,8 @@ mod tests {
             contract_name: ContractName("reth".into()),
             program_id: ProgramId(vec![]),
             settled_eth_chain_state,
+            pending_eth_chain_state,
+            submitted_txs: Arc::new(RwLock::new(HashMap::new())),
             base_state,
             pending_proofs: PendingProofsMap::new(),
             catching_up: false,
@@ -840,6 +959,30 @@ mod tests {
             tx_chain: Vec::new(),
             state_history: IndexMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn failed_tx_evicted_from_submitted_cache() {
+        let mut m = make_module().await;
+        let cn = m.contract_name.clone();
+        let id_a = make_tx_id(1);
+        let raw = make_signed_transfer(0);
+        let hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
+
+        m.submitted_txs.write().unwrap().insert(
+            hash,
+            SubmittedTx {
+                raw_eip2718: raw.clone(),
+                hyli_tx_hash: "deadbeef".into(),
+            },
+        );
+
+        m.handle_sequenced_tx(make_contract_tx(id_a.clone(), &[raw], &cn))
+            .await
+            .unwrap();
+        m.rollback_and_replay(&id_a).await;
+
+        assert!(!m.submitted_txs.read().unwrap().contains_key(&hash));
     }
 
     #[tokio::test]
