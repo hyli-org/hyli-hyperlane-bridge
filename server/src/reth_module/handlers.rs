@@ -130,6 +130,14 @@ fn encode_tx_json(
     let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718).ok()?;
     let from = tx.recover_signer().ok()?;
 
+    // Get v/r/s via TxEnvelope which exposes signature() directly.
+    // v is yParity (0 or 1) for EIP-1559; ethers-rs Transaction struct requires these fields.
+    let envelope = TxEnvelope::decode_2718(&mut &*raw_eip2718).ok()?;
+    let sig = envelope.signature();
+    let v_val: u64 = sig.v() as u64;
+    let r_bytes = sig.r().to_be_bytes::<32>();
+    let s_bytes = sig.s().to_be_bytes::<32>();
+
     Some(json!({
         "hash": format!("0x{}", hex::encode(tx_hash)),
         "blockHash": receipt.map(|r| format!("0x{}", hex::encode(r.block_hash))),
@@ -146,6 +154,9 @@ fn encode_tx_json(
         "nonce": format!("0x{:x}", tx.nonce()),
         "chainId": tx.chain_id().map(|v| format!("0x{:x}", v)),
         "type": tx_type_hex(raw_eip2718),
+        "v": format!("0x{:x}", v_val),
+        "r": format!("0x{}", hex::encode(r_bytes)),
+        "s": format!("0x{}", hex::encode(s_bytes)),
     }))
 }
 
@@ -190,6 +201,18 @@ pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> Js
         Ok(state) => state,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
+    // For a specific block number request, track whether we need to override the
+    // reported number (the synthetic block_number+1 case uses the real header but
+    // must advertise the requested number so ethers-rs doesn't see a fake reorg).
+    let number_override = match block_view {
+        BlockView::Number(n)
+            if state.get_header_by_number(n).is_none() && n == state.block_number + 1 =>
+        {
+            Some(n)
+        }
+        _ => None,
+    };
+
     let header = match block_view {
         BlockView::Latest | BlockView::Pending => state.latest_header(),
         BlockView::Earliest => state.get_header_by_number(0),
@@ -203,7 +226,13 @@ pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> Js
     };
 
     match header {
-        Some(h) => JsonRpcResponse::ok(id, block_json_from_header(&h)),
+        Some(h) => {
+            let mut block = block_json_from_header(&h);
+            if let Some(n) = number_override {
+                block["number"] = json!(format!("0x{:x}", n));
+            }
+            JsonRpcResponse::ok(id, block)
+        }
         None => JsonRpcResponse::ok(id, Value::Null),
     }
 }
@@ -860,19 +889,40 @@ pub fn eth_get_transaction_by_hash(ctx: &RouterCtx, id: Value, params: &Value) -
             .ok()
             .and_then(|txs| txs.get(&hash_bytes).cloned());
 
-        if let Some(submitted) = submitted {
-            if let Some(tx_json) =
-                encode_tx_json(&submitted.raw_eip2718, &hash_bytes, receipt.as_ref())
-            {
-                return JsonRpcResponse::ok(id, tx_json);
-            }
-        }
-
+        // Only return a response when we have a receipt (tx is confirmed).
+        // If the tx is in submitted_txs but has no receipt yet (still pending on Hyli),
+        // fall through to return null — this matches pre-commit behaviour and avoids
+        // confusing ethers-rs's PendingTransaction state machine with a "pending in
+        // mempool" response that it never sees transition to confirmed.
         if let Some(receipt) = receipt.as_ref() {
-            if let Some(tx_json) = encode_tx_json(&receipt.raw_eip2718, &hash_bytes, Some(receipt))
-            {
+            // Prefer submitted.raw_eip2718 (exact bytes from eth_sendRawTransaction) when
+            // available, so the `from` address and other fields are accurate.
+            let raw = submitted
+                .as_ref()
+                .map(|s| s.raw_eip2718.as_slice())
+                .unwrap_or(receipt.raw_eip2718.as_slice());
+            if let Some(tx_json) = encode_tx_json(raw, &hash_bytes, Some(receipt)) {
                 return JsonRpcResponse::ok(id, tx_json);
             }
+            // encode_tx_json failed (e.g. unsupported tx type) — fall back to a minimal
+            // response that still carries the block info ethers-rs needs.
+            return JsonRpcResponse::ok(
+                id,
+                json!({
+                    "hash": format!("0x{hash_hex}"),
+                    "blockHash": format!("0x{}", hex::encode(receipt.block_hash)),
+                    "blockNumber": format!("0x{:x}", receipt.block_number),
+                    "transactionIndex": "0x0",
+                    "from": "0x0000000000000000000000000000000000000000",
+                    "to": null,
+                    "value": "0x0",
+                    "gas": "0x0",
+                    "gasPrice": "0x0",
+                    "input": "0x",
+                    "nonce": "0x0",
+                    "type": "0x2",
+                }),
+            );
         }
     }
 
@@ -923,6 +973,33 @@ pub async fn eth_get_transaction_receipt(
                 success = r.success,
                 "→ returning receipt"
             );
+
+            // Decode from/to from raw tx bytes; prefer submitted_txs (exact bytes
+            // from eth_sendRawTransaction) over receipt bytes so the signer is accurate.
+            let submitted_raw = ctx
+                .submitted_txs
+                .read()
+                .ok()
+                .and_then(|txs| txs.get(&hash_bytes).map(|s| s.raw_eip2718.clone()));
+            let raw = submitted_raw.as_deref().unwrap_or(r.raw_eip2718.as_slice());
+            let (from_str, to_val) = if let Ok(tx) = TransactionSigned::decode_2718(&mut &*raw) {
+                let from = tx
+                    .recover_signer()
+                    .ok()
+                    .map(|a| format!("{a:?}"))
+                    .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+                let to = tx
+                    .to()
+                    .map(|addr| Value::String(format!("{addr:?}")))
+                    .unwrap_or(Value::Null);
+                (from, to)
+            } else {
+                (
+                    "0x0000000000000000000000000000000000000000".to_string(),
+                    Value::Null,
+                )
+            };
+
             let logs_json: Vec<Value> = r
                 .logs
                 .iter()
@@ -953,8 +1030,8 @@ pub async fn eth_get_transaction_receipt(
                     "transactionIndex": "0x0",
                     "blockHash": format!("0x{}", hex::encode(r.block_hash)),
                     "blockNumber": format!("0x{:x}", r.block_number),
-                    "from": "0x0000000000000000000000000000000000000000",
-                    "to": "0x0000000000000000000000000000000000000001",
+                    "from": from_str,
+                    "to": to_val,
                     "cumulativeGasUsed": "0x0",
                     "gasUsed": "0x0",
                     "logs": logs_json,
@@ -1042,7 +1119,10 @@ mod tests {
     }
 
     #[test]
-    fn transaction_by_hash_returns_pending_transaction_without_block_assignment() {
+    fn transaction_by_hash_returns_null_for_pending_transaction() {
+        // A tx that is in submitted_txs but not yet settled should return null so that
+        // ethers-rs PendingTransaction keeps polling rather than entering a "pending in
+        // mempool" state that may never transition to confirmed.
         let ctx = make_ctx();
         let raw = make_signed_transfer(0);
         let tx_hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
@@ -1060,12 +1140,8 @@ mod tests {
             json!(1),
             &json!([format!("0x{}", hex::encode(tx_hash))]),
         );
-        let tx = resp.result.expect("pending tx result");
-
-        assert_eq!(tx["blockHash"], Value::Null);
-        assert_eq!(tx["blockNumber"], Value::Null);
-        assert_eq!(tx["transactionIndex"], Value::Null);
-        assert_eq!(tx["nonce"], json!("0x0"));
+        // No receipt yet → null, not a "pending" object.
+        assert_eq!(resp.result, Some(Value::Null));
     }
 
     #[test]

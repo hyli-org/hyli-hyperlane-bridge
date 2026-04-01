@@ -56,6 +56,7 @@ case "$agent_type" in
     mkdir -p "$db_dir"
 
     exec docker run "${docker_args[@]}" \
+      --rm \
       -e "RELAYER_KEY=$RELAYER_KEY" \
       "$docker_image" \
       ./relayer --db "$container_data_root/relayer" \
