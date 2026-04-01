@@ -194,7 +194,7 @@ export function useBridge(direction: Direction) {
     functionName: 'quoteGasPayment',
     args: [destDomain],
     chainId: sourceChainId,
-    query: { enabled: toHyli },
+    query: { enabled: true },
   })
 
   const confirmingHash = toHyli && status.type === 'confirming' ? status.txHash : undefined

@@ -1,18 +1,28 @@
 use alloy_consensus::BlockHeader as AlloyBlockHeader;
+use alloy_consensus::Transaction as _;
 use alloy_consensus::TxEnvelope;
 use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::Address;
 use anyhow::Result;
 use client_sdk::rest_client::{IndexerApiHttpClient, NodeApiClient, NodeApiHttpClient};
+use reth_ethereum_primitives::TransactionSigned;
+use reth_primitives_traits::SignerRecoverable;
 use sdk::{Blob, BlobData, BlobTransaction, ContractName, Identity};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 use tracing::info;
 
-use crate::reth_module::eth_chain_state::EthChainState;
+use crate::reth_module::eth_chain_state::{EthChainState, EthTxReceipt};
 use crate::reth_module::types::JsonRpcResponse;
 use hyperlane_bridge::HyperlaneBridgeAction;
+
+#[derive(Clone, Debug)]
+pub struct SubmittedTx {
+    pub raw_eip2718: Vec<u8>,
+    pub hyli_tx_hash: String,
+}
 
 #[derive(Clone)]
 pub struct RouterCtx {
@@ -22,20 +32,27 @@ pub struct RouterCtx {
     pub relayer_identity: Identity,
     pub node_client: Arc<NodeApiHttpClient>,
     pub indexer_client: Arc<IndexerApiHttpClient>,
-    /// Shared EVM chain state, updated by the module's ContractListener event handler.
-    pub eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Settled EVM chain state, updated once Hyli confirms a transaction.
+    pub settled_eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Published pending/speculative EVM snapshot exposed via RPC.
+    pub pending_eth_chain_state: Arc<RwLock<EthChainState>>,
+    /// Locally submitted EVM transactions keyed by EVM tx hash.
+    pub submitted_txs: Arc<RwLock<HashMap<[u8; 32], SubmittedTx>>>,
     /// Set to true once backfilling is complete; RPC requests are rejected until then.
     pub is_ready: Arc<AtomicBool>,
 }
 
 impl RouterCtx {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         node_url: String,
         hyli_chain_id: u64,
         bridge_cn: ContractName,
         hyperlane_cn: ContractName,
         relayer_identity: Identity,
-        eth_chain_state: Arc<RwLock<EthChainState>>,
+        settled_eth_chain_state: Arc<RwLock<EthChainState>>,
+        pending_eth_chain_state: Arc<RwLock<EthChainState>>,
+        submitted_txs: Arc<RwLock<HashMap<[u8; 32], SubmittedTx>>>,
         is_ready: Arc<AtomicBool>,
     ) -> Result<Self> {
         let node_client = Arc::new(NodeApiHttpClient::new(node_url.clone())?);
@@ -47,7 +64,9 @@ impl RouterCtx {
             relayer_identity,
             node_client,
             indexer_client,
-            eth_chain_state,
+            settled_eth_chain_state,
+            pending_eth_chain_state,
+            submitted_txs,
             is_ready,
         })
     }
@@ -55,9 +74,95 @@ impl RouterCtx {
 
 // ── Block helpers ─────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockView {
+    Latest,
+    Pending,
+    Earliest,
+    Number(u64),
+}
+
+fn parse_block_view(tag: Option<&str>) -> BlockView {
+    match tag {
+        Some("pending") => BlockView::Pending,
+        None | Some("latest") => BlockView::Latest,
+        Some("earliest") => BlockView::Earliest,
+        Some(s) => u64::from_str_radix(s.trim_start_matches("0x"), 16)
+            .map(BlockView::Number)
+            .unwrap_or(BlockView::Latest),
+    }
+}
+
+fn current_pending_state(ctx: &RouterCtx) -> Result<EthChainState, JsonRpcResponse> {
+    match ctx.pending_eth_chain_state.read() {
+        Ok(state) => Ok(state.clone()),
+        Err(_) => Err(JsonRpcResponse::err(
+            json!(null),
+            -32603,
+            "State lock poisoned",
+        )),
+    }
+}
+
+fn state_for_view(ctx: &RouterCtx, view: BlockView) -> Result<EthChainState, JsonRpcResponse> {
+    match view {
+        BlockView::Pending => current_pending_state(ctx),
+        BlockView::Latest | BlockView::Earliest | BlockView::Number(_) => ctx
+            .settled_eth_chain_state
+            .read()
+            .map(|s| s.clone())
+            .map_err(|_| JsonRpcResponse::err(json!(null), -32603, "State lock poisoned")),
+    }
+}
+
+fn tx_type_hex(raw_eip2718: &[u8]) -> String {
+    match raw_eip2718.first().copied() {
+        Some(0x01..=0x04) => format!("0x{:x}", raw_eip2718[0]),
+        _ => "0x0".to_string(),
+    }
+}
+
+fn encode_tx_json(
+    raw_eip2718: &[u8],
+    tx_hash: &[u8; 32],
+    receipt: Option<&EthTxReceipt>,
+) -> Option<Value> {
+    let tx = TransactionSigned::decode_2718(&mut &*raw_eip2718).ok()?;
+    let from = tx.recover_signer().ok()?;
+
+    // Get v/r/s via TxEnvelope which exposes signature() directly.
+    // v is yParity (0 or 1) for EIP-1559; ethers-rs Transaction struct requires these fields.
+    let envelope = TxEnvelope::decode_2718(&mut &*raw_eip2718).ok()?;
+    let sig = envelope.signature();
+    let v_val: u64 = sig.v() as u64;
+    let r_bytes = sig.r().to_be_bytes::<32>();
+    let s_bytes = sig.s().to_be_bytes::<32>();
+
+    Some(json!({
+        "hash": format!("0x{}", hex::encode(tx_hash)),
+        "blockHash": receipt.map(|r| format!("0x{}", hex::encode(r.block_hash))),
+        "blockNumber": receipt.map(|r| format!("0x{:x}", r.block_number)),
+        "transactionIndex": receipt.map(|_| "0x0"),
+        "from": format!("{from:?}"),
+        "to": tx.to().map(|addr| format!("{addr:?}")),
+        "value": format!("{:#x}", tx.value()),
+        "gas": format!("0x{:x}", tx.gas_limit()),
+        "gasPrice": tx.gas_price().map(|v| format!("0x{:x}", v)),
+        "maxFeePerGas": format!("0x{:x}", tx.max_fee_per_gas()),
+        "maxPriorityFeePerGas": tx.max_priority_fee_per_gas().map(|v| format!("0x{:x}", v)),
+        "input": format!("0x{}", hex::encode(tx.input())),
+        "nonce": format!("0x{:x}", tx.nonce()),
+        "chainId": tx.chain_id().map(|v| format!("0x{:x}", v)),
+        "type": tx_type_hex(raw_eip2718),
+        "v": format!("0x{:x}", v_val),
+        "r": format!("0x{}", hex::encode(r_bytes)),
+        "s": format!("0x{}", hex::encode(s_bytes)),
+    }))
+}
+
 pub fn eth_block_number(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     let block_number = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.block_number)
         .unwrap_or(0);
@@ -73,7 +178,7 @@ pub fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     // Fall back to the configured chain ID so we never return "0x0" (ethers.js
     // treats chainId=0 as "no network" and throws NETWORK_ERROR).
     let chain_id = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.chain_id())
         .unwrap_or(ctx.hyli_chain_id);
@@ -82,7 +187,7 @@ pub fn eth_chain_id(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
 
 pub fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     let chain_id = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.chain_id())
         .unwrap_or(ctx.hyli_chain_id);
@@ -90,34 +195,44 @@ pub fn net_version(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
 }
 
 pub fn eth_get_block_by_number(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
-    let block_tag = params.get(0).and_then(|v| v.as_str()).unwrap_or("latest");
+    let block_view = parse_block_view(params.get(0).and_then(|v| v.as_str()));
 
-    let header = ctx
-        .eth_chain_state
-        .read()
-        .ok()
-        .and_then(|state| match block_tag {
-            "latest" | "pending" => state.latest_header(),
-            "earliest" => state.get_header_by_number(0),
-            tag => {
-                let n_str = tag.trim_start_matches("0x");
-                u64::from_str_radix(n_str, 16).ok().and_then(|n| {
-                    state.get_header_by_number(n).or_else(|| {
-                        // eth_blockNumber reports (block_number + 1) as the current block
-                        // so callers like ethers-rs may request that number directly.
-                        // Fall back to the latest actual header to avoid returning null.
-                        if n == state.block_number + 1 {
-                            state.latest_header()
-                        } else {
-                            None
-                        }
-                    })
-                })
+    let state = match state_for_view(ctx, block_view) {
+        Ok(state) => state,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+    // For a specific block number request, track whether we need to override the
+    // reported number (the synthetic block_number+1 case uses the real header but
+    // must advertise the requested number so ethers-rs doesn't see a fake reorg).
+    let number_override = match block_view {
+        BlockView::Number(n)
+            if state.get_header_by_number(n).is_none() && n == state.block_number + 1 =>
+        {
+            Some(n)
+        }
+        _ => None,
+    };
+
+    let header = match block_view {
+        BlockView::Latest | BlockView::Pending => state.latest_header(),
+        BlockView::Earliest => state.get_header_by_number(0),
+        BlockView::Number(n) => state.get_header_by_number(n).or_else(|| {
+            if n == state.block_number + 1 {
+                state.latest_header()
+            } else {
+                None
             }
-        });
+        }),
+    };
 
     match header {
-        Some(h) => JsonRpcResponse::ok(id, block_json_from_header(&h)),
+        Some(h) => {
+            let mut block = block_json_from_header(&h);
+            if let Some(n) = number_override {
+                block["number"] = json!(format!("0x{:x}", n));
+            }
+            JsonRpcResponse::ok(id, block)
+        }
         None => JsonRpcResponse::ok(id, Value::Null),
     }
 }
@@ -151,9 +266,8 @@ fn block_json_from_header(h: &reth_primitives_traits::SealedHeader) -> Value {
 
 pub fn eth_get_code(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
-    let code_hex = ctx
-        .eth_chain_state
-        .read()
+    let block_view = parse_block_view(params.get(1).and_then(|v| v.as_str()));
+    let code_hex = state_for_view(ctx, block_view)
         .map(|s| {
             s.accounts
                 .get(&addr)
@@ -204,9 +318,8 @@ pub fn eth_estimate_gas(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRe
         .map(alloy_primitives::U256::from)
         .unwrap_or_default();
 
-    let gas = ctx
-        .eth_chain_state
-        .read()
+    let block_view = parse_block_view(params.get(1).and_then(|v| v.as_str()));
+    let gas = state_for_view(ctx, block_view)
         .map(|s| s.estimate_gas(from, to, data, value))
         .unwrap_or(5_000_000);
 
@@ -227,9 +340,8 @@ pub fn eth_get_storage_at(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
     slot_arr[copy_start..].copy_from_slice(&slot_bytes[slot_bytes.len().saturating_sub(32)..]);
     let slot = alloy_primitives::U256::from_be_bytes(slot_arr);
 
-    let value = ctx
-        .eth_chain_state
-        .read()
+    let block_view = parse_block_view(params.get(2).and_then(|v| v.as_str()));
+    let value = state_for_view(ctx, block_view)
         .map(|s| {
             s.accounts
                 .get(&addr)
@@ -244,9 +356,8 @@ pub fn eth_get_storage_at(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
 
 pub fn eth_get_balance(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
-    let balance = ctx
-        .eth_chain_state
-        .read()
+    let block_view = parse_block_view(params.get(1).and_then(|v| v.as_str()));
+    let balance = state_for_view(ctx, block_view)
         .map(|s| s.account_balance(&addr))
         .unwrap_or_default();
     JsonRpcResponse::ok(id, json!(format!("0x{:x}", balance)))
@@ -254,17 +365,46 @@ pub fn eth_get_balance(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
 
 pub fn eth_get_transaction_count(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
     let addr = parse_address_param(params, 0);
-    let nonce = ctx
-        .eth_chain_state
-        .read()
+    let block_view = parse_block_view(params.get(1).and_then(|v| v.as_str()));
+    let state_nonce = state_for_view(ctx, block_view)
         .map(|s| s.account_nonce(&addr))
         .unwrap_or(0);
+    let submitted_nonce = if block_view == BlockView::Pending {
+        ctx.submitted_txs
+            .read()
+            .ok()
+            .map(|txs| {
+                txs.iter()
+                    .filter_map(|(hash, submitted)| {
+                        let settled = ctx
+                            .settled_eth_chain_state
+                            .read()
+                            .ok()
+                            .map(|s| s.settled_receipts.contains_key(hash))
+                            .unwrap_or(false);
+                        if settled {
+                            return None;
+                        }
+                        let tx =
+                            TransactionSigned::decode_2718(&mut submitted.raw_eip2718.as_slice())
+                                .ok()?;
+                        let signer = tx.recover_signer().ok()?;
+                        (signer == addr).then_some(tx.nonce() + 1)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    let nonce = state_nonce.max(submitted_nonce);
     JsonRpcResponse::ok(id, json!(format!("0x{:x}", nonce)))
 }
 
 pub fn eth_gas_price(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     let gas_price = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.gas_price())
         .unwrap_or(1);
@@ -287,7 +427,7 @@ pub fn eth_fee_history(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
         .max(1);
 
     let base_fee = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.gas_price())
         .unwrap_or(1_000_000_000);
@@ -297,7 +437,7 @@ pub fn eth_fee_history(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRes
     let gas_used_ratios: Vec<f64> = (0..block_count).map(|_| 0.5).collect();
 
     let oldest_block = ctx
-        .eth_chain_state
+        .settled_eth_chain_state
         .read()
         .map(|s| s.block_number.saturating_sub(block_count))
         .unwrap_or(0);
@@ -321,7 +461,10 @@ pub fn eth_get_logs(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcRespon
         None => json!({}),
     };
 
-    let state = match ctx.eth_chain_state.read() {
+    let state = match state_for_view(
+        ctx,
+        parse_block_view(filter.get("toBlock").and_then(|v| v.as_str())),
+    ) {
         Ok(s) => s,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
@@ -503,7 +646,7 @@ pub fn hyli_get_tx_by_message_id(ctx: &RouterCtx, id: Value, params: &Value) -> 
         }
     };
 
-    let state = match ctx.eth_chain_state.read() {
+    let state = match ctx.settled_eth_chain_state.read() {
         Ok(s) => s,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
@@ -534,21 +677,31 @@ pub fn hyli_get_hyli_hash(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpc
         }
     };
 
-    let state = match ctx.eth_chain_state.read() {
-        Ok(s) => s,
-        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
-    };
+    if let Ok(submitted) = ctx.submitted_txs.read() {
+        if let Some(tx) = submitted.get(&evm_hash_bytes) {
+            return JsonRpcResponse::ok(id, json!({ "hyliTxHash": tx.hyli_tx_hash }));
+        }
+    } else {
+        return JsonRpcResponse::err(id, -32603, "State lock poisoned");
+    }
 
-    match state.evm_to_hyli_hash.get(&evm_hash_bytes) {
-        Some(hyli_hash) => JsonRpcResponse::ok(id, json!({ "hyliTxHash": hyli_hash })),
-        None => JsonRpcResponse::ok(id, Value::Null),
+    match ctx.settled_eth_chain_state.read() {
+        Ok(state) => match state.evm_to_hyli_hash.get(&evm_hash_bytes) {
+            Some(hyli_hash) => JsonRpcResponse::ok(id, json!({ "hyliTxHash": hyli_hash })),
+            None => JsonRpcResponse::ok(id, Value::Null),
+        },
+        Err(_) => JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     }
 }
 
 // ── debug_dumpGenesis ─────────────────────────────────────────────────────────
 
 pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
-    let state = match ctx.eth_chain_state.read() {
+    let state = match ctx.settled_eth_chain_state.read() {
+        Ok(s) => s,
+        Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
+    };
+    let pending_state = match current_pending_state(ctx) {
         Ok(s) => s,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
@@ -564,6 +717,7 @@ pub fn debug_dump_genesis(ctx: &RouterCtx, id: Value) -> JsonRpcResponse {
     let alloc = state.dump_genesis_alloc();
     let n = alloc.as_object().map(|m| m.len()).unwrap_or(0);
     genesis["alloc"] = alloc;
+    genesis["pendingStateRoot"] = json!(format!("0x{}", hex::encode(pending_state.state_root)));
     info!(accounts = n, "debug_dumpGenesis");
     JsonRpcResponse::ok(id, genesis)
 }
@@ -607,7 +761,10 @@ pub fn eth_call(ctx: &RouterCtx, id: Value, params: &Value) -> JsonRpcResponse {
         .map(U256::from)
         .unwrap_or(U256::ZERO);
 
-    let state = match ctx.eth_chain_state.read() {
+    let state = match state_for_view(
+        ctx,
+        parse_block_view(params.get(1).and_then(|v| v.as_str())),
+    ) {
         Ok(s) => s,
         Err(_) => return JsonRpcResponse::err(id, -32603, "State lock poisoned"),
     };
@@ -672,6 +829,7 @@ pub async fn eth_send_raw_transaction(
     // Build the Hyli blob transaction:
     //   blob[0]: hyperlane reth blob  ← raw EIP-2718 bytes (proven by reth verifier)
     //   blob[1]: hyperlane-bridge blob ← VerifyTransaction (proven by RISC0)
+    let submitted_raw = raw_bytes.clone();
     let blobs = vec![
         Blob {
             contract_name: ctx.hyperlane_cn.clone(),
@@ -695,8 +853,14 @@ pub async fn eth_send_raw_transaction(
 
     // Store EVM hash → Hyli blob hash so the frontend can build correct explorer links.
     let hyli_hash_hex = hex::encode(&hyli_tx_hash.0);
-    if let Ok(mut state) = ctx.eth_chain_state.write() {
-        state.evm_to_hyli_hash.insert(*evm_tx_hash, hyli_hash_hex);
+    if let Ok(mut submitted) = ctx.submitted_txs.write() {
+        submitted.insert(
+            *evm_tx_hash,
+            SubmittedTx {
+                raw_eip2718: submitted_raw,
+                hyli_tx_hash: hyli_hash_hex,
+            },
+        );
     }
 
     JsonRpcResponse::ok(id, json!(format!("0x{}", hex::encode(*evm_tx_hash))))
@@ -715,18 +879,39 @@ pub fn eth_get_transaction_by_hash(ctx: &RouterCtx, id: Value, params: &Value) -
 
     if let Some(hash_bytes) = evm_hash_bytes {
         let receipt = ctx
-            .eth_chain_state
+            .settled_eth_chain_state
             .read()
             .map(|s| s.settled_receipts.get(&hash_bytes).cloned())
             .unwrap_or(None);
+        let submitted = ctx
+            .submitted_txs
+            .read()
+            .ok()
+            .and_then(|txs| txs.get(&hash_bytes).cloned());
 
-        if let Some(r) = receipt {
+        // Only return a response when we have a receipt (tx is confirmed).
+        // If the tx is in submitted_txs but has no receipt yet (still pending on Hyli),
+        // fall through to return null — this matches pre-commit behaviour and avoids
+        // confusing ethers-rs's PendingTransaction state machine with a "pending in
+        // mempool" response that it never sees transition to confirmed.
+        if let Some(receipt) = receipt.as_ref() {
+            // Prefer submitted.raw_eip2718 (exact bytes from eth_sendRawTransaction) when
+            // available, so the `from` address and other fields are accurate.
+            let raw = submitted
+                .as_ref()
+                .map(|s| s.raw_eip2718.as_slice())
+                .unwrap_or(receipt.raw_eip2718.as_slice());
+            if let Some(tx_json) = encode_tx_json(raw, &hash_bytes, Some(receipt)) {
+                return JsonRpcResponse::ok(id, tx_json);
+            }
+            // encode_tx_json failed (e.g. unsupported tx type) — fall back to a minimal
+            // response that still carries the block info ethers-rs needs.
             return JsonRpcResponse::ok(
                 id,
                 json!({
                     "hash": format!("0x{hash_hex}"),
-                    "blockHash": format!("0x{}", hex::encode(r.block_hash)),
-                    "blockNumber": format!("0x{:x}", r.block_number),
+                    "blockHash": format!("0x{}", hex::encode(receipt.block_hash)),
+                    "blockNumber": format!("0x{:x}", receipt.block_number),
                     "transactionIndex": "0x0",
                     "from": "0x0000000000000000000000000000000000000000",
                     "to": null,
@@ -764,7 +949,7 @@ pub async fn eth_get_transaction_receipt(
 
     if let Some(hash_bytes) = evm_hash_bytes {
         let (receipt, settled_count) = ctx
-            .eth_chain_state
+            .settled_eth_chain_state
             .read()
             .map(|s| {
                 (
@@ -788,6 +973,33 @@ pub async fn eth_get_transaction_receipt(
                 success = r.success,
                 "→ returning receipt"
             );
+
+            // Decode from/to from raw tx bytes; prefer submitted_txs (exact bytes
+            // from eth_sendRawTransaction) over receipt bytes so the signer is accurate.
+            let submitted_raw = ctx
+                .submitted_txs
+                .read()
+                .ok()
+                .and_then(|txs| txs.get(&hash_bytes).map(|s| s.raw_eip2718.clone()));
+            let raw = submitted_raw.as_deref().unwrap_or(r.raw_eip2718.as_slice());
+            let (from_str, to_val) = if let Ok(tx) = TransactionSigned::decode_2718(&mut &*raw) {
+                let from = tx
+                    .recover_signer()
+                    .ok()
+                    .map(|a| format!("{a:?}"))
+                    .unwrap_or_else(|| "0x0000000000000000000000000000000000000000".to_string());
+                let to = tx
+                    .to()
+                    .map(|addr| Value::String(format!("{addr:?}")))
+                    .unwrap_or(Value::Null);
+                (from, to)
+            } else {
+                (
+                    "0x0000000000000000000000000000000000000000".to_string(),
+                    Value::Null,
+                )
+            };
+
             let logs_json: Vec<Value> = r
                 .logs
                 .iter()
@@ -818,8 +1030,8 @@ pub async fn eth_get_transaction_receipt(
                     "transactionIndex": "0x0",
                     "blockHash": format!("0x{}", hex::encode(r.block_hash)),
                     "blockNumber": format!("0x{:x}", r.block_number),
-                    "from": "0x0000000000000000000000000000000000000000",
-                    "to": "0x0000000000000000000000000000000000000001",
+                    "from": from_str,
+                    "to": to_val,
                     "cumulativeGasUsed": "0x0",
                     "gasUsed": "0x0",
                     "logs": logs_json,
@@ -846,4 +1058,152 @@ fn parse_address_param(params: &Value, index: usize) -> Address {
                 .map(|b| Address::from_slice(&b))
         })
         .unwrap_or(Address::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::reth_module::eth_chain_state::tests::{make_signed_transfer, TEST_GENESIS};
+    use sdk::Identity;
+
+    fn make_ctx() -> RouterCtx {
+        RouterCtx {
+            hyli_chain_id: 1213811785,
+            bridge_cn: ContractName("bridge".into()),
+            hyperlane_cn: ContractName("reth".into()),
+            relayer_identity: Identity("test".into()),
+            node_client: Arc::new(
+                NodeApiHttpClient::new("http://localhost:1".to_string()).unwrap(),
+            ),
+            indexer_client: Arc::new(
+                IndexerApiHttpClient::new("http://localhost:1".to_string()).unwrap(),
+            ),
+            settled_eth_chain_state: Arc::new(RwLock::new(
+                EthChainState::new(TEST_GENESIS.as_bytes()).unwrap(),
+            )),
+            pending_eth_chain_state: Arc::new(RwLock::new(
+                EthChainState::new(TEST_GENESIS.as_bytes()).unwrap(),
+            )),
+            submitted_txs: Arc::new(RwLock::new(HashMap::new())),
+            is_ready: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    #[test]
+    fn pending_nonce_includes_submitted_transactions() {
+        let ctx = make_ctx();
+        let raw = make_signed_transfer(0);
+        let tx_hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
+
+        ctx.submitted_txs.write().unwrap().insert(
+            tx_hash,
+            SubmittedTx {
+                raw_eip2718: raw,
+                hyli_tx_hash: "deadbeef".into(),
+            },
+        );
+
+        let latest = eth_get_transaction_count(
+            &ctx,
+            json!(1),
+            &json!(["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", "latest"]),
+        );
+        let pending = eth_get_transaction_count(
+            &ctx,
+            json!(1),
+            &json!(["0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266", "pending"]),
+        );
+
+        assert_eq!(latest.result, Some(json!("0x0")));
+        assert_eq!(pending.result, Some(json!("0x1")));
+    }
+
+    #[test]
+    fn transaction_by_hash_returns_null_for_pending_transaction() {
+        // A tx that is in submitted_txs but not yet settled should return null so that
+        // ethers-rs PendingTransaction keeps polling rather than entering a "pending in
+        // mempool" state that may never transition to confirmed.
+        let ctx = make_ctx();
+        let raw = make_signed_transfer(0);
+        let tx_hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
+
+        ctx.submitted_txs.write().unwrap().insert(
+            tx_hash,
+            SubmittedTx {
+                raw_eip2718: raw,
+                hyli_tx_hash: "deadbeef".into(),
+            },
+        );
+
+        let resp = eth_get_transaction_by_hash(
+            &ctx,
+            json!(1),
+            &json!([format!("0x{}", hex::encode(tx_hash))]),
+        );
+        // No receipt yet → null, not a "pending" object.
+        assert_eq!(resp.result, Some(Value::Null));
+    }
+
+    #[test]
+    fn transaction_by_hash_returns_settled_transaction_without_submitted_cache() {
+        let ctx = make_ctx();
+        let raw = make_signed_transfer(0);
+        let tx_hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
+        {
+            let mut state = ctx.settled_eth_chain_state.write().unwrap();
+            state.apply_transaction_speculative(&raw).unwrap();
+            state.record_settled_receipt(&raw, true, vec![]);
+        }
+
+        let resp = eth_get_transaction_by_hash(
+            &ctx,
+            json!(1),
+            &json!([format!("0x{}", hex::encode(tx_hash))]),
+        );
+        let tx = resp.result.expect("settled tx result");
+
+        assert_ne!(tx["blockHash"], Value::Null);
+        assert_ne!(tx["blockNumber"], Value::Null);
+        assert_eq!(tx["nonce"], json!("0x0"));
+    }
+
+    #[test]
+    fn pending_block_view_uses_pending_state() {
+        let ctx = make_ctx();
+        let raw = make_signed_transfer(0);
+        ctx.pending_eth_chain_state
+            .write()
+            .unwrap()
+            .apply_transaction_speculative(&raw)
+            .unwrap();
+
+        let latest = eth_get_block_by_number(&ctx, json!(1), &json!(["latest", false]));
+        let pending = eth_get_block_by_number(&ctx, json!(1), &json!(["pending", false]));
+
+        assert_eq!(latest.result.unwrap()["number"], json!("0x0"));
+        assert_eq!(pending.result.unwrap()["number"], json!("0x1"));
+    }
+
+    #[test]
+    fn hyli_hash_lookup_falls_back_to_submitted_cache() {
+        let ctx = make_ctx();
+        let raw = make_signed_transfer(0);
+        let tx_hash: [u8; 32] = *alloy_primitives::keccak256(&raw);
+
+        ctx.submitted_txs.write().unwrap().insert(
+            tx_hash,
+            SubmittedTx {
+                raw_eip2718: raw,
+                hyli_tx_hash: "deadbeef".into(),
+            },
+        );
+
+        let resp = hyli_get_hyli_hash(
+            &ctx,
+            json!(1),
+            &json!([format!("0x{}", hex::encode(tx_hash))]),
+        );
+
+        assert_eq!(resp.result, Some(json!({ "hyliTxHash": "deadbeef" })));
+    }
 }
