@@ -2,7 +2,8 @@
 
 import { useBalance, useReadContracts, useAccount } from 'wagmi'
 import { formatUnits } from 'viem'
-import { SEPOLIA_CHAIN_ID, HYLI_CHAIN_ID, HYLI_TOKEN_CONTRACT } from '@/lib/hyperlane'
+import { SEPOLIA_CHAIN_ID, HYLI_CHAIN_ID } from '@/lib/hyperlane'
+import { useRuntimeConfig } from '@/lib/runtimeConfig'
 
 const ERC20_ABI = [
   {
@@ -23,20 +24,21 @@ const ERC20_ABI = [
 
 export function useNativeBalance(chainId: number = SEPOLIA_CHAIN_ID) {
   const { address } = useAccount()
+  const { hyliWarpContract } = useRuntimeConfig()
   const isHyli = chainId === HYLI_CHAIN_ID
 
   // On Hyli: 2 calls (balanceOf + decimals) instead of wagmi's 4-call useBalance(token) path
   const { data: tokenData, isLoading: tokenLoading, refetch: tokenRefetch } = useReadContracts({
     contracts: [
       {
-        address: HYLI_TOKEN_CONTRACT,
+        address: hyliWarpContract,
         abi: ERC20_ABI,
         functionName: 'balanceOf',
         args: [address!],
         chainId: HYLI_CHAIN_ID,
       },
       {
-        address: HYLI_TOKEN_CONTRACT,
+        address: hyliWarpContract,
         abi: ERC20_ABI,
         functionName: 'decimals',
         chainId: HYLI_CHAIN_ID,

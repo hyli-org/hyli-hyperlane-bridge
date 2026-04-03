@@ -4,7 +4,7 @@ import { WagmiProvider } from 'wagmi'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { createWagmiConfig } from '@/config/wagmi'
 import {
-  DEFAULT_HYLI_INDEXER_URL,
+  DEFAULT_PUBLIC_RUNTIME_CONFIG,
   DEFAULT_HYLI_RPC_URL,
   RuntimeConfigProvider,
   type PublicRuntimeConfig,
@@ -32,10 +32,7 @@ export function Providers({ children }: { children: React.ReactNode }) {
       } catch {
         if (cancelled) return
 
-        const fallbackConfig: PublicRuntimeConfig = {
-          hyliRpcUrl: DEFAULT_HYLI_RPC_URL,
-          hyliIndexerUrl: DEFAULT_HYLI_INDEXER_URL,
-        }
+        const fallbackConfig: PublicRuntimeConfig = DEFAULT_PUBLIC_RUNTIME_CONFIG
 
         setRuntimeConfig(fallbackConfig)
         setWagmiConfig(createWagmiConfig(fallbackConfig.hyliRpcUrl))

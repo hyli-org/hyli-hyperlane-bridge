@@ -4,10 +4,6 @@ import { useState, useEffect, useRef } from 'react'
 import { parseEther, keccak256, toBytes } from 'viem'
 import { useWriteContract, useReadContract, useAccount, useSwitchChain, useWaitForTransactionReceipt } from 'wagmi'
 import {
-  SEPOLIA_WARP_CONTRACT,
-  SEPOLIA_MAILBOX,
-  HYLI_WARP_CONTRACT,
-  HYLI_MAILBOX,
   HYLI_DOMAIN,
   HYLI_CHAIN_ID,
   SEPOLIA_DOMAIN,
@@ -118,6 +114,7 @@ async function fetchHyliHashByEvmHash(hyliRpcUrl: string, evmHash: `0x${string}`
 async function pollSepoliaProcessId(
   messageId: `0x${string}`,
   sepoliaRpcUrl: string,
+  sepoliaMailbox: `0x${string}`,
   timeoutMs = 120_000,
 ): Promise<string | undefined> {
   const deadline = Date.now() + timeoutMs
@@ -141,7 +138,7 @@ async function pollSepoliaProcessId(
         jsonrpc: '2.0',
         id: 2,
         method: 'eth_getLogs',
-        params: [{ address: SEPOLIA_MAILBOX, topics: [PROCESS_ID_TOPIC, messageId], fromBlock, toBlock: 'latest' }],
+        params: [{ address: sepoliaMailbox, topics: [PROCESS_ID_TOPIC, messageId], fromBlock, toBlock: 'latest' }],
       }),
     })
     const { result: logs = [] }: { result: { transactionHash: string }[] } = await logsRes.json()
@@ -152,12 +149,20 @@ async function pollSepoliaProcessId(
 }
 
 export function useBridge(direction: Direction) {
-  const { hyliRpcUrl, hyliIndexerUrl } = useRuntimeConfig()
+  const {
+    hyliRpcUrl,
+    hyliIndexerUrl,
+    sepoliaRpcUrl,
+    sepoliaWarpContract,
+    sepoliaMailbox,
+    hyliWarpContract,
+    hyliMailbox,
+  } = useRuntimeConfig()
   const toHyli = direction === 'to_hyli'
   const sourceChainId = toHyli ? SEPOLIA_CHAIN_ID : HYLI_CHAIN_ID
-  const warpContract = toHyli ? SEPOLIA_WARP_CONTRACT : HYLI_WARP_CONTRACT
+  const warpContract = toHyli ? sepoliaWarpContract : hyliWarpContract
   const destDomain = toHyli ? HYLI_DOMAIN : SEPOLIA_DOMAIN
-  const sourceMailbox = toHyli ? SEPOLIA_MAILBOX : HYLI_MAILBOX
+  const sourceMailbox = toHyli ? sepoliaMailbox : hyliMailbox
 
   const { address, chainId } = useAccount()
   const { switchChainAsync } = useSwitchChain()
@@ -328,8 +333,7 @@ export function useBridge(direction: Direction) {
           return
         }
 
-        const sepoliaRpcUrl = process.env.NEXT_PUBLIC_SEPOLIA_RPC_URL!
-        const sepoliaTx = await pollSepoliaProcessId(messageId, sepoliaRpcUrl, 110_000)
+        const sepoliaTx = await pollSepoliaProcessId(messageId, sepoliaRpcUrl, sepoliaMailbox, 110_000)
         if (cancelled) return
         clearTimeout(timeoutId)
         if (sepoliaTx) setStatus({ type: 'success', txHash: info.txHash, hyliSrcHash, destTxHash: sepoliaTx })
@@ -344,7 +348,7 @@ export function useBridge(direction: Direction) {
       cancelled = true
       clearTimeout(timeoutId)
     }
-  }, [hyliIndexerUrl, hyliRpcUrl, status.type, toHyli])
+  }, [hyliIndexerUrl, hyliRpcUrl, sepoliaMailbox, sepoliaRpcUrl, status.type, toHyli])
 
   async function bridge(amountEth: string, recipient?: `0x${string}`) {
     if (!address) {

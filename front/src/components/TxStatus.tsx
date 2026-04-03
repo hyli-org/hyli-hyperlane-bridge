@@ -1,7 +1,7 @@
 'use client'
 
 import type { BridgeStatus, Direction } from '@/hooks/useBridge'
-import { ETHERSCAN_BASE_URL, HYLI_EXPLORER_BASE_URL } from '@/lib/hyperlane'
+import { useRuntimeConfig } from '@/lib/runtimeConfig'
 
 interface TxStatusProps {
   status: BridgeStatus
@@ -67,9 +67,10 @@ function StepRow({ done, active, failed, label, href, hash }: {
 export function TxStatus({ status, direction, onReset }: TxStatusProps) {
   if (status.type === 'idle') return null
 
+  const { etherscanBaseUrl, hyliExplorerBaseUrl } = useRuntimeConfig()
   const toHyli = direction === 'to_hyli'
-  const srcExplorer = toHyli ? ETHERSCAN_BASE_URL : HYLI_EXPLORER_BASE_URL
-  const dstExplorer = toHyli ? HYLI_EXPLORER_BASE_URL : ETHERSCAN_BASE_URL
+  const srcExplorer = toHyli ? etherscanBaseUrl : hyliExplorerBaseUrl
+  const dstExplorer = toHyli ? hyliExplorerBaseUrl : etherscanBaseUrl
   const srcChain = toHyli ? 'Sepolia' : 'Hyli'
   const dstChain = toHyli ? 'Hyli' : 'Sepolia'
 
