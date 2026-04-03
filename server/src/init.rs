@@ -51,7 +51,7 @@ pub async fn init_contracts(conf: &Conf, node: Arc<NodeApiHttpClient>) -> Result
                 program_id: ProgramId(metadata::HYPERLANE_BRIDGE_PROGRAM_ID.to_vec()),
                 state_commitment: bridge_state.commit(),
                 contract_name: bridge_cn.clone(),
-                timeout_window: None,
+                timeout_window: Some((5, 5)),
                 constructor_metadata: None,
             })
             .await
@@ -84,7 +84,7 @@ pub async fn init_contracts(conf: &Conf, node: Arc<NodeApiHttpClient>) -> Result
                 program_id,
                 state_commitment: StateCommitment(eth_state_root),
                 contract_name: hyperlane_cn.clone(),
-                timeout_window: None,
+                timeout_window: Some((5, 5)),
                 constructor_metadata: None,
             })
             .await
