@@ -19,6 +19,8 @@ FROM rust:latest
 WORKDIR /app
 
 COPY --from=builder /app/target/debug/server ./
+COPY --from=builder /root/.risc0 /root/.risc0
+ENV PATH="/root/.risc0/bin:$PATH"
 
 RUN apt-get update && apt-get install -y libdbus-1-dev
 
